@@ -296,7 +296,44 @@ step_proot() {
             xfce4 xfce4-terminal dbus-x11 \
             sudo curl wget git htop nano > /dev/null 2>&1
     " 2>/dev/null || true
-    echo -e "  [+] ${PROOT_LABEL} ready."
+
+    # ---- Global --no-sandbox wrapper for Electron/Chromium apps in proot ----
+    proot-distro login "$PROOT_DISTRO" -- bash -c "
+        cat > /usr/local/bin/proot-sandbox-fix << 'SANDBOXFIX'
+#!/bin/bash
+# Proot Sandbox Fix — auto-append --no-sandbox for Electron/Chromium apps
+# Proot lacks user namespaces, so Chrome/Electron sandbox fails without this.
+REAL_BIN=\$(which \"\$1\" 2>/dev/null | head -1)
+[ -z \"\$REAL_BIN\" ] && REAL_BIN=\"\$(command -v \"\$1\" 2>/dev/null)\"
+if [ -z \"\$REAL_BIN\" ]; then
+    echo \"[!] '\$1' not found. Install it first.\"
+    exit 1
+fi
+shift
+export CHROME_DEVEL_SANDBOX=\"\"
+exec \"\$REAL_BIN\" --no-sandbox --disable-gpu-sandbox \"\$@\"
+SANDBOXFIX
+        chmod +x /usr/local/bin/proot-sandbox-fix
+
+        # Known Electron/Chromium apps: create convenience wrappers
+        for app in code code-insiders chromium chromium-browser google-chrome \
+                   brave-browser microsoft-edge discord slack teams skype \
+                   obsidian notion atom github-desktop figma-linux; do
+            [ -f \"/usr/local/bin/\$app\" ] && continue
+            [ ! \"\$(command -v \$app 2>/dev/null)\" ] && continue
+            ln -sf /usr/local/bin/proot-sandbox-fix \"/usr/local/bin/\$app\" 2>/dev/null
+        done
+
+        # Also create a global electron-flags config
+        mkdir -p /etc/proot-sandbox
+        cat > /etc/proot-sandbox/env.sh << 'ENVEOF'
+# Global Electron/Chromium sandbox flags for proot
+export ELECTRON_NO_SANDBOX=1
+export CHROME_DEVEL_SANDBOX=''
+export ELECTRON_DISABLE_SANDBOX=1
+ENVEOF
+    " 2>/dev/null || true
+    echo -e "  [+] Proot sandbox fix applied (Electron/Chromium --no-sandbox wrappers)"
 
     # ---- Create named user with working sudo ----
     echo -e "  [*] Creating proot user: ${SETUP_USERNAME} (with sudo)..."
@@ -367,9 +404,16 @@ export MESA_VK_WSI_PRESENT_MODE=immediate
 [ -f /usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json ] && \
     export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json
 export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
+# Sandbox fix for Electron/Chromium apps in proot
+export CHROME_DEVEL_SANDBOX=
+export ELECTRON_NO_SANDBOX=1
+export ELECTRON_DISABLE_SANDBOX=1
+[ -f /etc/proot-sandbox/env.sh ] && source /etc/proot-sandbox/env.sh
+
 export PS1="\[\033[01;32m\]$SETUP_USERNAME@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
 echo ""
 echo " User: $SETUP_USERNAME | GPU: GALLIUM=\${GALLIUM_DRIVER}"
+echo " Tip: Use /usr/local/bin/<app> for sandbox-free Electron apps"
 echo " Type 'exit' to leave proot."
 echo ""
 RCEOF
@@ -451,6 +495,14 @@ for desktop_file in "$PROOT_APPS"/*.desktop; do
 
     APP_CMD="$CLEAN_EXEC"
     EXTRA_ENV=""
+
+    # Auto-append --no-sandbox for Electron/Chromium apps (proot lacks user namespaces)
+    if echo "$appname" | grep -qiE "code|vscode|code-insiders|chromium|chrome|brave|edge|discord|slack|teams|skype|obsidian|notion|atom|github-desktop|figma|electron|msedge|microsoft-edge"; then
+        if ! echo "$APP_CMD" | grep -q -- "--no-sandbox"; then
+            APP_CMD="$APP_CMD --no-sandbox --disable-gpu-sandbox"
+        fi
+        EXTRA_ENV="${EXTRA_ENV} export CHROME_DEVEL_SANDBOX=; export ELECTRON_NO_SANDBOX=1; export ELECTRON_DISABLE_SANDBOX=1;"
+    fi
 
     echo "$appname" | grep -qi "libreoffice\|soffice" && \
         APP_CMD="$CLEAN_EXEC --norestore --nofirststartwizard"

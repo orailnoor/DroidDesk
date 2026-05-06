@@ -4,6 +4,14 @@ Run a full Linux desktop on any Android phone. Not a terminal. Not an emulator. 
 
 Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your entire setup comes with you.
 
+## What's New
+
+| Change | Details | Reason |
+|---|---|---|
+| **Proot Sandbox Fix** | Global `--no-sandbox` wrapper script installed inside proot at `/usr/local/bin/proot-sandbox-fix`, plus symlinks for `code`, `chromium`, `brave`, `discord`, `slack`, `teams`, and other Electron/Chromium apps | Proot lacks user namespaces, so Electron/Chromium sandbox crashes with `--no-sandbox` error — the fix auto-appends `--no-sandbox --disable-gpu-sandbox` to all affected binaries |
+| **App Bridge Sandbox Detection** | `proot-menu-sync.sh` auto-detects Electron/Chromium apps by name and injects `--no-sandbox` flags and sandbox-disabling env vars into the desktop launcher wrappers | Ensures apps launched from the XFCE menu (not just terminal) also bypass the sandbox correctly |
+| **Environment Variable Protection** | Proot shell rcfile exports `ELECTRON_NO_SANDBOX=1`, `ELECTRON_DISABLE_SANDBOX=1`, and `CHROME_DEVEL_SANDBOX=` globally; `/etc/proot-sandbox/env.sh` sources on login | Catches any Electron app that respects env vars instead of CLI flags, even if it's not in the name-based detection list |
+
 ## Video
 
 [![Watch the video](https://img.youtube.com/vi/QCr4WWsfVv8/maxresdefault.jpg)](https://youtu.be/QCr4WWsfVv8)
