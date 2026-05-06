@@ -289,13 +289,67 @@ step_proot() {
     echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
     proot-distro login "$PROOT_DISTRO" -- bash -c "
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y -q > /dev/null 2>&1
+        apt-get update -y -q 2>/tmp/proot-setup.log || {
+            echo '[!] apt-get update FAILED — GPG keys may be stale'
+            echo '[!] log saved at /tmp/proot-setup.log inside proot'
+        }
+        apt-get install -y -q --no-install-recommends \
+            gnupg ca-certificates software-properties-common 2>/tmp/proot-setup.log || true
+        apt-get install -y -q --reinstall debian-archive-keyring 2>/dev/null || true
+        apt-key adv --keyserver keyserver.ubuntu.com \
+            --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C 2>/dev/null || true
+        apt-get update -y -q 2>/tmp/proot-setup.log || true
         apt-get install -y -q --no-install-recommends \
             mesa-utils vulkan-tools \
-            libgl1-mesa-glx libvulkan1 libgles2 \
+            libgl1-mesa-glx libvulkan1 libgles2-mesa \
             xfce4 xfce4-terminal dbus-x11 \
-            sudo curl wget git htop nano > /dev/null 2>&1
-    " 2>/dev/null || true
+            sudo curl wget git htop nano 2>/tmp/proot-setup.log
+    "
+    echo -e "  [+] Proot bootstrap complete (check /tmp/proot-setup.log inside proot if errors)"
+
+    # If Ubuntu — ensure universe/multiverse keys are valid (common expiry in old rootfs)
+    if [ "$PROOT_DISTRO" = "ubuntu" ]; then
+        proot-distro login "$PROOT_DISTRO" -- bash -c "
+            apt-key adv --keyserver keyserver.ubuntu.com \
+                --recv-keys 3B4FE6ACC0B21F32 2>/dev/null || true
+            apt-get update -y -q 2>/dev/null || true
+        " 2>/dev/null
+    fi
+
+    # ---- For Ubuntu proot: add Debian Bookworm repo as default source ----
+    # Ubuntu ships several packages (chromium, firefox, thunderbird) as snap-only
+    # transitional packages that silently fail inside proot (no systemd/snapd).
+    # Debian still ships them as proper .deb packages — use Debian as the primary
+    # source and pin Ubuntu low, so apt install <anything> gets a working binary.
+    if [ "$PROOT_DISTRO" = "ubuntu" ]; then
+        proot-distro login "$PROOT_DISTRO" -- bash -c "
+            # Add Debian Bookworm main/updates repos
+            if [ ! -f /etc/apt/sources.list.d/debian-bookworm.list ]; then
+                echo 'deb http://deb.debian.org/debian bookworm main' \
+                    > /etc/apt/sources.list.d/debian-bookworm.list
+                echo 'deb http://deb.debian.org/debian bookworm-updates main' \
+                    >> /etc/apt/sources.list.d/debian-bookworm.list
+
+                # Pin Debian at normal priority (500). Pin Ubuntu low so Debian wins
+                # on any package that exists in both repos. This avoids snapd deps.
+                cat > /etc/apt/preferences.d/debian-bookworm << 'PINEOF'
+Package: *
+Pin: release o=Debian
+Pin-Priority: 500
+
+Package: *
+Pin: release o=Ubuntu
+Pin-Priority: 99
+PINEOF
+                # Fetch Debian archive signing key
+                apt-key adv --keyserver keyserver.ubuntu.com \
+                    --recv-keys 54404762BBB6E853 648ACFD622F3D138 \
+                    0E98404D386FA1D9 2>/dev/null || true
+                apt-get update -y -q 2>/dev/null || true
+                echo '  [+] Debian Bookworm repo added as default (avoids snap-only Ubuntu packages)'
+            fi
+        " 2>/dev/null
+    fi
 
     # ---- Global --no-sandbox wrapper for Electron/Chromium apps in proot ----
     proot-distro login "$PROOT_DISTRO" -- bash -c "
@@ -466,15 +520,16 @@ if ! "$PROOT_BIN" login "$PROOT_DISTRO" -- which dbus-run-session > /dev/null 2>
     "$PROOT_BIN" login "$PROOT_DISTRO" -- apt-get install -y -q dbus-x11 > /dev/null 2>&1
 fi
 
-SYNCED=0
-REMOVED=0
+SYNCED_APPS=()
+REMOVED_APPS=()
 
 for bridge_file in "$BRIDGE_DIR"/proot-*.desktop; do
     [ -f "$bridge_file" ] || continue
     original_name=$(basename "$bridge_file" | sed 's/^proot-//')
     if [ ! -f "$PROOT_APPS/$original_name" ]; then
+        DISPLAY_NAME=$(grep "^Name=" "$bridge_file" | head -1 | sed 's/^Name=\[P\] //; s/^Name=//')
         rm -f "$bridge_file" "$WRAPPER_DIR/proot-${original_name%.desktop}.sh"
-        REMOVED=$((REMOVED + 1))
+        REMOVED_APPS+=("${DISPLAY_NAME:-${original_name%.desktop}}")
     fi
 done
 
@@ -486,8 +541,13 @@ for desktop_file in "$PROOT_APPS"/*.desktop; do
     output="$BRIDGE_DIR/proot-$filename"
     wrapper="$WRAPPER_DIR/proot-${appname}.sh"
 
-    grep -q "^NoDisplay=true" "$desktop_file" 2>/dev/null && continue
-    grep -q "^Hidden=true"    "$desktop_file" 2>/dev/null && continue
+    # Skip truly hidden entries, but force-show known user-facing apps
+    if echo "$appname" | grep -qiE "chromium|chromium-browser|firefox|firefox-esr|code|vscode|code-insiders|libreoffice|gimp|vlc"; then
+        : # force-show — skip NoDisplay check
+    elif grep -q "^NoDisplay=true" "$desktop_file" 2>/dev/null; then
+        continue
+    fi
+    grep -q "^Hidden=true" "$desktop_file" 2>/dev/null && continue
 
     ORIGINAL_EXEC=$(grep "^Exec=" "$desktop_file" | head -1 | sed 's/^Exec=//')
     [ -z "$ORIGINAL_EXEC" ] && continue
@@ -562,12 +622,35 @@ WRAPEOF
 
     APP_NAME=$(grep "^Name=" "$output" | head -1 | sed 's/^Name=//')
     [[ "$APP_NAME" != \[P\]* ]] && sed -i "s|^Name=.*|Name=[P] $APP_NAME|" "$output"
-    SYNCED=$((SYNCED + 1))
+    SYNCED_APPS+=("${APP_NAME}")
 done
 
-echo "[+] Bridge: $SYNCED synced, $REMOVED removed."
+echo ""
+echo "============================================="
+echo "  Proot Menu Bridge Sync Complete"
+echo "============================================="
+if [ ${#SYNCED_APPS[@]} -gt 0 ]; then
+    echo "  Synced (${#SYNCED_APPS[@]} apps):"
+    for app in "${SYNCED_APPS[@]}"; do
+        echo "    [+] $app"
+    done
+else
+    echo "  No apps synced"
+fi
+if [ ${#REMOVED_APPS[@]} -gt 0 ]; then
+    echo "  Removed (${#REMOVED_APPS[@]} apps):"
+    for app in "${REMOVED_APPS[@]}"; do
+        echo "    [-] $app"
+    done
+fi
+echo ""
 echo "    Logs: \$TERMUX_TMP/proot-<appname>.log"
 echo "    Re-run after new installs: bash ~/proot-menu-sync.sh"
+
+# Force menu cache rebuild so garcon picks up bridge entries on next XFCE start
+rm -f "$HOME/.cache/menus/"* 2>/dev/null
+echo "    Menu cache cleared — apps will appear on next XFCE restart"
+echo ""
 
 pgrep -x "xfce4-panel" > /dev/null 2>&1 && xfce4-panel --restart > /dev/null 2>&1 &
 pgrep -x "xfdesktop"   > /dev/null 2>&1 && { sleep 1; xfdesktop --reload > /dev/null 2>&1 & }
@@ -661,7 +744,7 @@ sleep 3
 export DISPLAY=:0
 
 # Sync proot apps into menu (background, non-blocking)
-[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh > /dev/null 2>&1 &
+[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh &
 
 echo "----------------------------------------------"
 echo "  [*] Open the Termux-X11 app to see desktop"
@@ -866,7 +949,7 @@ FREOF
 [Desktop Entry]
 Type=Application
 Name=XFCE First Run Setup
-Exec=bash /root/.config/xfce-first-run.sh
+Exec=bash ${HOME}/.config/xfce-first-run.sh
 Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
@@ -955,7 +1038,7 @@ EOF
 [Desktop Entry]
 Name=Linux Container
 Comment=Open Proot Shell with GPU support
-Exec=${term_cmd} -e "bash /root/start-proot.sh"
+Exec=${term_cmd} -e "bash ${HOME}/start-proot.sh"
 Icon=system-run
 Type=Application
 Terminal=false
