@@ -1,8 +1,8 @@
 # DroidDesk
 
-Run a full Linux desktop on any Android phone. Not a terminal. Not an emulator. A complete desktop environment with direct kernel access -- VS Code, Blender, Metasploit, local AI, all of it.
+Run a full Linux desktop on an Android phone. Not a terminal. Not an emulator. A real desktop environment with GPU acceleration, a proper app menu, and a workflow that now reaches into both the Linux side and the Android side of the phone.
 
-Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your entire setup comes with you.
+Plug the phone into a monitor and it behaves like a compact desktop machine. Unplug it and the full setup stays in your pocket.
 
 ## Video
 
@@ -10,25 +10,34 @@ Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your en
 
 ## What This Actually Runs
 
-Everything below has been tested and confirmed working:
+Everything below has been tested and confirmed working on the Linux side:
 
-- **LibreOffice** -- Word processing, spreadsheets, presentations. Fully functional.
-- **VS Code** -- Full version. Python, PIP, extensions, everything.
-- **Claude Code** -- AI coding agent running directly in terminal.
-- **Blender** -- Installs and opens. Laggy on mobile hardware, but it runs.
-- **Wireshark** -- Full network analysis, every packet and protocol.
-- **Metasploit** -- Pentesting framework, runs fine.
-- **Local AI** -- Offline LLM inference, 5+ tokens/second, no API needed.
+- **LibreOffice** for documents, spreadsheets, and presentations.
+- **VS Code** with Python, PIP, extensions, and normal desktop workflows.
+- **Claude Code** running directly in terminal inside DroidDesk.
+- **Blender** on mobile hardware. Heavy, but functional.
+- **Wireshark** for packet inspection and network analysis.
+- **Metasploit** for security and research workflows.
+- **Local AI** for offline LLM inference without an API.
 
-If it runs on Ubuntu, it runs here.
+The new Android integration layer also lets DroidDesk index installed Android apps and expose launchers for them inside the Linux desktop menu. On phones and ROMs that support freeform windows or strong external-display multitasking, that gets very close to a true mixed Android + Linux desk setup. On standard Android builds, it still removes the friction of bouncing back through the launcher every time you need a phone app.
+
+## What Changed
+
+- **Android App Bridge** scans installed Android apps and adds launchers directly into DroidDesk.
+- **APK handoff** lets you trigger Android APK installation from Termux with a single command.
+- **Automatic refresh** runs when the desktop starts so new Android apps can appear in the menu without manual cleanup.
+- **Waydroid helper hook** is included for advanced users running a compatible rooted/kernel-capable environment where Waydroid is already installed separately.
 
 ## How It Works
 
-The Linux environment runs through Termux with direct access to the phone's kernel. No emulation, no translation -- native performance.
+The Linux environment runs through Termux with direct access to the phone's kernel. No emulation, no VM, and no translation layer for the Linux desktop itself.
 
-The setup script installs a full desktop (XFCE4/LXQt/MATE/KDE) inside Termux using the Termux User Repository (TUR) for GUI apps. For tools not available in TUR (Wireshark, Metasploit, etc.), a Proot container provides a standard Ubuntu/Debian/Kali environment where you install anything with `apt`.
+The setup script installs a full desktop environment inside Termux using the X11 and TUR repositories. For heavier packages that are not available natively in Termux, DroidDesk provisions a Proot container and then mirrors those Linux applications back into the desktop menu with the built-in App Bridge.
 
-The automatic menu sync scans what you install inside Proot and adds it directly to your desktop app menu. No need to enter the container every time.
+The new Android App Bridge does the same kind of thing for the phone side. It scans installed Android packages, resolves their launcher activities, and creates desktop entries so they can be started from inside DroidDesk.
+
+For advanced users experimenting beyond stock rootless Termux, a `start-waydroid.sh` helper is also generated. That helper is intentionally separate from the main install path because Waydroid needs a compatible Linux base plus binder/memfd-capable kernel support and is not something DroidDesk can honestly promise on every standard Android phone.
 
 ## DroidDesk App (Standalone)
 
@@ -42,17 +51,20 @@ Download the latest release APK from the Releases tab and sideload it to begin.
 
 ## Requirements
 
-- Any Android phone (ARM64)
-- [Termux](https://f-droid.org/en/packages/com.termux/) (install from F-Droid, not Play Store)
-- [Termux-X11](https://github.com/termux/termux-x11/releases/tag/nightly) (for on-phone display)
+- Any Android phone with ARM64 support
+- [Termux](https://f-droid.org/en/packages/com.termux/) from F-Droid
+- [Termux-X11](https://github.com/termux/termux-x11/releases/tag/nightly) for on-phone display
 
-### For Monitor Output ( Optional )
+### For Monitor Output (Optional)
 
-**Option A: USB-C Display Output**
-If your phone supports display output over USB-C, just use a USB-C to HDMI adapter. Done.
+**Option A: USB-C display output**
 
-**Option B: Raspberry Pi Bridge**
-For phones without display output (most mid-range phones with USB 2.0), use a Raspberry Pi Zero 2W as a bridge:
+If your phone supports display output over USB-C, use a USB-C to HDMI adapter.
+
+**Option B: Raspberry Pi bridge**
+
+For phones without display output, you can use a Raspberry Pi Zero 2W as a bridge:
+
 - Raspberry Pi Zero 2W with Raspberry Pi OS
 - Micro USB to USB-C cable
 - USB-C hub
@@ -60,23 +72,25 @@ For phones without display output (most mid-range phones with USB 2.0), use a Ra
 - SD card with Pi firmware
 - Wireless keyboard and mouse
 
-The Pi connects to the phone via USB tethering, detects the phone's IP automatically, and opens a VNC viewer to display the phone's desktop on the monitor.
+The Pi connects through USB tethering, detects the phone automatically, and opens a fullscreen VNC session on the monitor.
 
 ## Installation
 
 ### Step 1: Install Termux
 
-Download and install Termux from F-Droid:
+Install Termux from F-Droid:
+
 https://f-droid.org/en/packages/com.termux/
 
-Do NOT use the Play Store version. It is outdated and will not work.
+Do not use the Play Store build.
 
 ### Step 2: Install Termux-X11
 
 Download the latest APK from:
+
 https://github.com/termux/termux-x11/releases/tag/nightly
 
-Install it on your phone. This is the display server that renders the desktop.
+Install it on the phone. This is the display server used by DroidDesk.
 
 ### Step 3: Run the Setup Script
 
@@ -88,46 +102,56 @@ bash setup.sh
 ```
 
 The script will:
+
 1. Update Termux packages
-2. Add X11 and TUR repositories
-3. Install your chosen desktop environment (XFCE4/LXQt/MATE/KDE)
-4. Set up GPU acceleration (Turnip for Adreno, Zink fallback for others)
+2. Add the X11 and TUR repositories
+3. Install your desktop environment
+4. Configure GPU acceleration
 5. Install Firefox, Git, Python, and core tools
-6. Set up a Proot Linux container (Ubuntu/Debian/Kali)
-7. Create the App Bridge for automatic menu syncing
-8. Apply a modern dark theme
-9. Optionally set up VNC for remote access
+6. Set up a Proot Linux container
+7. Sync Proot Linux apps into the desktop menu
+8. Build the Android App Bridge and scan installed Android apps
+9. Apply the desktop theme and shortcuts
+10. Optionally set up VNC for remote or bridge use
 
 ### Step 4: Start the Desktop
 
-After installation completes:
+After installation:
 
 ```bash
 bash ~/start-x11.sh
 ```
 
-Then open the Termux-X11 app on your phone. Your desktop is ready.
+Then open the Termux-X11 app on the phone.
 
-### Step 5: Install Apps Inside Proot
+### Step 5: Install Linux Apps Inside Proot
 
-To install tools that are not in TUR:
+For packages that are not in TUR:
 
 ```bash
 bash ~/start-proot.sh
-apt install wireshark    # or any other package
+apt install wireshark
 exit
 bash ~/proot-menu-sync.sh
 ```
 
-The app will appear in your desktop menu automatically.
+The Linux app will appear in the desktop menu.
+
+### Step 6: Refresh Android App Launchers
+
+If you install a new Android app and want to refresh the DroidDesk menu immediately:
+
+```bash
+bash ~/android-app-sync.sh
+```
 
 ## Raspberry Pi Monitor Bridge Setup
 
-If you are using a Raspberry Pi Zero 2W to output to a monitor:
+If you are using a Raspberry Pi Zero 2W for monitor output:
 
 ### Step 1: Flash Raspberry Pi OS
 
-Flash standard Raspberry Pi OS to an SD card and boot the Pi.
+Flash a standard Raspberry Pi OS image and boot the Pi.
 
 ### Step 2: Install VNC Viewer on the Pi
 
@@ -138,8 +162,6 @@ sudo apt install realvnc-vnc-viewer
 
 ### Step 3: Copy the Launcher Script
 
-Copy `pi-launch_phone.sh` to your Pi:
-
 ```bash
 curl -sL https://raw.githubusercontent.com/orailnoor/DroidDesk/main/pi-launch_phone.sh -o ~/pi-launch_phone.sh
 chmod +x ~/pi-launch_phone.sh
@@ -147,57 +169,48 @@ chmod +x ~/pi-launch_phone.sh
 
 ### Step 4: Connect and Launch
 
-1. Connect the phone to the Pi via USB cable
-2. Enable USB Tethering on the phone
-3. Start VNC on the phone: `bash ~/start-vnc.sh` (in Termux)
+1. Connect the phone to the Pi by USB
+2. Enable USB tethering on the phone
+3. Start VNC on the phone with `bash ~/start-vnc.sh`
 4. Run the bridge script on the Pi:
 
 ```bash
 bash ~/pi-launch_phone.sh
 ```
 
-The script auto-detects the phone's IP and opens a fullscreen VNC session on the monitor.
-
-### Optional: Auto-Launch on Boot
-
-To make the Pi automatically connect when powered on, add to crontab:
-
-```bash
-crontab -e
-```
-
-Add this line:
-
-```
-@reboot sleep 15 && /home/pi/pi-launch_phone.sh
-```
+The Pi will detect the phone IP and open the VNC desktop in fullscreen.
 
 ## Commands Reference
 
 | Command | What It Does |
 |---|---|
-| `bash ~/start-x11.sh` | Start desktop via Termux-X11 |
-| `bash ~/start-vnc.sh` | Start desktop via VNC (if installed) |
-| `bash ~/start-proot.sh` | Open Proot Linux shell |
-| `bash ~/proot-menu-sync.sh` | Sync Proot apps to desktop menu |
-| `bash ~/stop-linux.sh` | Stop all sessions |
+| `bash ~/start-x11.sh` | Start DroidDesk through Termux-X11 |
+| `bash ~/start-vnc.sh` | Start DroidDesk through VNC |
+| `bash ~/start-proot.sh` | Open the Proot Linux shell |
+| `bash ~/proot-menu-sync.sh` | Refresh Linux app launchers from Proot |
+| `bash ~/android-app-sync.sh` | Refresh Android app launchers from the phone side |
+| `bash ~/install-android-apk.sh /path/to/app.apk` | Hand an APK to Android's package installer |
+| `bash ~/start-waydroid.sh` | Launch the advanced Waydroid helper if Waydroid is already installed separately |
+| `bash ~/stop-linux.sh` | Stop active desktop services |
 
 ## Notes
 
 > [!WARNING]
-> **Disable Child Process in Developer Options**
-> On some Android versions (MIUI, One UI, stock Android 13+), the system may kill Termux background processes and drop your desktop session. To prevent this:
-> 1. Go to **Settings → Developer Options**
-> 2. Find **"Child process"** (may be labeled differently depending on your ROM)
-> 3. Disable child process restrictions for Termux
->
-> Without this, long-running sessions (VNC, Termux-X11) may be killed by the OS without warning.
+> **Disable aggressive child-process restrictions**
+> On some Android builds, the OS may kill Termux background processes and break long-running desktop sessions. If that happens, check Developer Options and disable the child-process restriction affecting Termux.
 
-- Termux-X11 directly on the phone is faster than VNC. Use VNC only when you need monitor output through the Pi bridge or remote access from another device.
-- For standalone phone use without a monitor, Termux-X11 is the recommended option.
-- The Proot container shares the display with the native Termux desktop. Apps installed in Proot render on the same screen.
-- GPU acceleration works best on Adreno GPUs (Qualcomm Snapdragon phones). Other GPUs fall back to software rendering.
+- Termux-X11 on the phone is faster than VNC. Use VNC mainly for Pi bridge output or remote access.
+- The Proot container shares the same display as the native Termux desktop, so Linux apps launched through the bridge appear in the same environment.
+- The Android App Bridge launches the phone's native Android apps. On standard Android builds, those apps may come forward outside the Termux-X11 window. On devices with better desktop-mode or freeform-window support, the mixed workflow feels much more seamless.
+- GPU acceleration is strongest on Adreno-based phones. Other GPUs fall back to slower rendering paths.
+- The included `start-waydroid.sh` helper is for advanced compatible environments only. Stock rootless Termux users should treat the Android App Bridge as the supported Android integration path.
 
 ## Credits
 
 Created by [orailnoor](https://youtube.com/@orailnoor)
+
+Android integration update by [Samin Yeasar](https://github.com/solez-ai), who pushed the mixed Android + Linux workflow forward with the Android app bridge direction, launcher sync improvements, and the advanced Waydroid-ready helper entry point.
+
+- Instagram: [solez_ai](https://www.instagram.com/solez_ai/)
+- GitHub: [solez-ai](https://github.com/solez-ai)
+- X: [Solez_None](https://x.com/Solez_None)

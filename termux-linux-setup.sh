@@ -9,11 +9,13 @@
 #  - Modern dark XFCE theme + auto wallpaper
 #  - Proot Linux container (Ubuntu/Debian/Kali)
 #  - Proot App Bridge (apt installs appear in XFCE menu)
+#  - Android App Bridge (native phone apps appear in desktop menus)
+#  - Waydroid helper hooks for compatible advanced setups
 #  - Python & Web Dev environment
 #######################################################
 
 # ============== CONFIGURATION ==============
-TOTAL_STEPS=12
+TOTAL_STEPS=13
 CURRENT_STEP=0
 DE_CHOICE="1"
 DE_NAME="XFCE4"
@@ -541,7 +543,193 @@ SYNCEOF
     bash ~/proot-menu-sync.sh "$PROOT_DISTRO" 2>/dev/null || true
 }
 
-# ============== STEP 10: LAUNCHERS ==============
+# ============== STEP 10: ANDROID BRIDGE ==============
+step_android_bridge() {
+    update_progress
+    echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Configuring Android App Bridge...${NC}"
+    echo ""
+
+    mkdir -p ~/.local/share/android-bridge ~/.local/share/applications/android-bridge
+
+    cat > ~/.local/share/android-bridge/launch-android-app.sh << 'ANDROIDLAUNCHEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+PKG="$1"
+COMPONENT="$2"
+
+if [ -z "$PKG" ]; then
+    echo "[!] Usage: launch-android-app.sh <package> [component]"
+    exit 1
+fi
+
+if [ -n "$COMPONENT" ] && command -v am > /dev/null 2>&1; then
+    am start --user 0 -n "$COMPONENT" > /dev/null 2>&1 && exit 0
+fi
+
+if command -v am > /dev/null 2>&1; then
+    am start --user 0 \
+        -a android.intent.action.MAIN \
+        -c android.intent.category.LAUNCHER \
+        -p "$PKG" > /dev/null 2>&1 && exit 0
+fi
+
+if command -v monkey > /dev/null 2>&1; then
+    monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1 && exit 0
+fi
+
+echo "[!] Unable to launch $PKG from Termux."
+echo "    Make sure Android activity tools are available on this device."
+exit 1
+ANDROIDLAUNCHEOF
+    chmod +x ~/.local/share/android-bridge/launch-android-app.sh
+
+    cat > ~/install-android-apk.sh << 'APKINSTALLEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+APK_PATH="$1"
+
+if [ -z "$APK_PATH" ]; then
+    echo "Usage: bash ~/install-android-apk.sh /path/to/app.apk"
+    exit 1
+fi
+
+if [ ! -f "$APK_PATH" ]; then
+    echo "[!] APK not found: $APK_PATH"
+    exit 1
+fi
+
+if command -v termux-open > /dev/null 2>&1; then
+    termux-open --content-type application/vnd.android.package-archive "$APK_PATH"
+    exit $?
+fi
+
+echo "[!] termux-open is not available. Install termux-tools or open the APK manually."
+exit 1
+APKINSTALLEOF
+    chmod +x ~/install-android-apk.sh
+
+    cat > ~/start-waydroid.sh << 'WAYDROIDEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+echo ""
+echo "=============================================="
+echo "  [*] Starting Waydroid helper session..."
+echo "=============================================="
+echo ""
+
+if ! command -v waydroid > /dev/null 2>&1; then
+    echo "[!] Waydroid is not installed in this environment."
+    echo "    DroidDesk already runs on Android, so the built-in Android App Bridge"
+    echo "    is the supported path on standard Termux setups."
+    echo "    Use this helper only on advanced rooted/kernel-capable builds where"
+    echo "    Waydroid is already installed separately."
+    exit 1
+fi
+
+export DISPLAY=${DISPLAY:-:0}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp}
+
+waydroid container start
+waydroid session start > /dev/null 2>&1 &
+sleep 4
+waydroid prop set persist.waydroid.multi_windows true > /dev/null 2>&1 || true
+waydroid prop set persist.waydroid.width_padding 0 > /dev/null 2>&1 || true
+waydroid prop set persist.waydroid.height_padding 0 > /dev/null 2>&1 || true
+waydroid show-full-ui
+WAYDROIDEOF
+    chmod +x ~/start-waydroid.sh
+
+    cat > ~/android-app-sync.sh << 'ANDROIDSYNCEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+BRIDGE_DIR="$HOME/.local/share/applications/android-bridge"
+WRAPPER_DIR="$HOME/.local/share/android-bridge"
+LAUNCHER="$WRAPPER_DIR/launch-android-app.sh"
+
+mkdir -p "$BRIDGE_DIR" "$WRAPPER_DIR"
+
+if [ ! -x "$LAUNCHER" ]; then
+    echo "[!] Android launcher helper is missing: $LAUNCHER"
+    exit 1
+fi
+
+for bridge_file in "$BRIDGE_DIR"/android-*.desktop; do
+    [ -f "$bridge_file" ] || continue
+    case "$(basename "$bridge_file")" in
+        android-refresh.desktop) continue ;;
+    esac
+    rm -f "$bridge_file"
+done
+
+if command -v cmd > /dev/null 2>&1; then
+    PACKAGE_LIST=$(cmd package list packages -3 2>/dev/null | sed 's/^package=//')
+else
+    PACKAGE_LIST=$(pm list packages -3 2>/dev/null | sed 's/^package=//')
+fi
+
+SYNCED=0
+
+for pkg in $PACKAGE_LIST; do
+    [ -n "$pkg" ] || continue
+
+    COMPONENT=""
+    if command -v cmd > /dev/null 2>&1; then
+        COMPONENT=$(cmd package resolve-activity --brief "$pkg" 2>/dev/null | tail -n 1 | tr -d '\r')
+        case "$COMPONENT" in
+            "No activity found"*) continue ;;
+        esac
+    fi
+
+    LABEL=$(dumpsys package "$pkg" 2>/dev/null | sed -n \
+        -e "s/.*application-label:'\\(.*\\)'.*/\\1/p" \
+        -e "s/.*application-label:\\(.*\\)$/\\1/p" | head -1)
+    [ -z "$LABEL" ] && LABEL=$(echo "$pkg" | awk -F. '{print $NF}')
+
+    SAFE_NAME=$(echo "$pkg" | tr '.:' '--')
+    DESKTOP_FILE="$BRIDGE_DIR/android-$SAFE_NAME.desktop"
+
+    cat > "$DESKTOP_FILE" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=[A] $LABEL
+Comment=Launch Android app $pkg
+Exec=$LAUNCHER $pkg $COMPONENT
+Icon=smartphone
+Categories=Utility;
+Terminal=false
+StartupNotify=false
+EOF
+
+    SYNCED=$((SYNCED + 1))
+done
+
+cat > "$BRIDGE_DIR/android-refresh.desktop" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=[A] Refresh Android Apps
+Comment=Rescan installed Android apps and refresh DroidDesk launchers
+Exec=bash $HOME/android-app-sync.sh
+Icon=view-refresh
+Categories=System;
+Terminal=false
+StartupNotify=false
+EOF
+
+chmod +x "$BRIDGE_DIR"/*.desktop 2>/dev/null
+
+pgrep -x "xfce4-panel" > /dev/null 2>&1 && xfce4-panel --restart > /dev/null 2>&1 &
+pgrep -x "xfdesktop" > /dev/null 2>&1 && { sleep 1; xfdesktop --reload > /dev/null 2>&1 & }
+
+echo "[+] Android bridge synced: $SYNCED apps"
+ANDROIDSYNCEOF
+    chmod +x ~/android-app-sync.sh
+
+    bash ~/android-app-sync.sh > /dev/null 2>&1 || true
+
+    echo -e "  [+] Created ~/android-app-sync.sh"
+    echo -e "  [+] Created ~/install-android-apk.sh"
+    echo -e "  [+] Created ~/start-waydroid.sh"
+}
+
+# ============== STEP 11: LAUNCHERS ==============
 step_launchers() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Creating Startup Scripts...${NC}"
@@ -624,6 +812,7 @@ export DISPLAY=:0
 
 # Sync proot apps into menu (background, non-blocking)
 [ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh > /dev/null 2>&1 &
+[ -f ~/android-app-sync.sh ] && bash ~/android-app-sync.sh > /dev/null 2>&1 &
 
 echo "----------------------------------------------"
 echo "  [*] Open the Termux-X11 app to see desktop"
@@ -644,6 +833,7 @@ pkill -9 -f "Xvnc" 2>/dev/null
 pkill -9 -f "pulseaudio" 2>/dev/null
 ${KILL_CMD}
 pkill -9 -f "dbus" 2>/dev/null
+command -v waydroid > /dev/null 2>&1 && waydroid session stop > /dev/null 2>&1
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
 echo "Done."
 STOPEOF
@@ -651,7 +841,7 @@ STOPEOF
     echo -e "  [+] Created ~/stop-linux.sh"
 }
 
-# ============== STEP 11: XFCE MODERN THEME ==============
+# ============== STEP 12: XFCE MODERN THEME ==============
 step_theme_xfce() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Configuring Modern XFCE Theme...${NC}"
@@ -877,7 +1067,7 @@ AREOF
     echo -e "  [+] First-run script will configure panels on first launch"
 }
 
-# ============== STEP 12: SHORTCUTS ==============
+# ============== STEP 13: SHORTCUTS ==============
 step_shortcuts() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Creating Desktop Shortcuts...${NC}"
@@ -923,8 +1113,28 @@ Type=Application
 Terminal=false
 EOF
 
+    cat > ~/Desktop/AndroidApps.desktop << EOF
+[Desktop Entry]
+Name=Android Apps
+Comment=Refresh Android app launchers from the phone side
+Exec=${term_cmd} -e "bash /root/android-app-sync.sh; echo; read -p 'Press Enter to close...'"
+Icon=smartphone
+Type=Application
+Terminal=false
+EOF
+
+    cat > ~/Desktop/Waydroid.desktop << EOF
+[Desktop Entry]
+Name=Waydroid Helper
+Comment=Launch Waydroid on compatible advanced setups
+Exec=${term_cmd} -e "bash /root/start-waydroid.sh; echo; read -p 'Press Enter to close...'"
+Icon=applications-system
+Type=Application
+Terminal=false
+EOF
+
     chmod +x ~/Desktop/*.desktop 2>/dev/null
-    echo -e "  [+] Shortcuts: Firefox, Files, Terminal, Proot"
+    echo -e "  [+] Shortcuts: Firefox, Files, Terminal, Proot, Android Apps, Waydroid Helper"
 }
 
 # ============== VNC (OPTIONAL — asked at end) ==============
@@ -1035,6 +1245,7 @@ COMPLETE
     echo "    - Firefox, Git, Python 3"
     echo "    - GPU Acceleration (Turnip/Zink)"
     echo "    - Proot Linux Container + App Bridge"
+    echo "    - Android App Bridge for native phone apps"
     echo "    - Modern Dark XFCE Theme (Adwaita + Dracula terminal)"
     echo ""
     echo -e "${YELLOW}============================================================${NC}"
@@ -1055,6 +1266,15 @@ COMPLETE
     echo ""
     echo -e "  ${GREEN}Install proot app → sync to XFCE menu:${NC}"
     echo -e "    ${WHITE}bash ~/proot-menu-sync.sh${NC}"
+    echo ""
+    echo -e "  ${GREEN}Refresh Android apps in the desktop menu:${NC}"
+    echo -e "    ${WHITE}bash ~/android-app-sync.sh${NC}"
+    echo ""
+    echo -e "  ${GREEN}Install an Android APK from Termux:${NC}"
+    echo -e "    ${WHITE}bash ~/install-android-apk.sh /path/to/app.apk${NC}"
+    echo ""
+    echo -e "  ${GREEN}Advanced Waydroid helper (only if you installed Waydroid separately):${NC}"
+    echo -e "    ${WHITE}bash ~/start-waydroid.sh${NC}"
     echo ""
     echo -e "  ${GREEN}Stop everything:${NC}"
     echo -e "    ${WHITE}bash ~/stop-linux.sh${NC}"
@@ -1084,6 +1304,7 @@ main() {
     step_apps
     step_python
     step_proot
+    step_android_bridge
     step_launchers
     step_theme_xfce
     step_shortcuts
