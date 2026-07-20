@@ -398,32 +398,32 @@ class ChrootRuntime(private val context: Context) {
     fun ensureMounts() {
         if (!hasRoot()) return
 
-        val mounts = rootShell.exec("mount").lines()
-        fun isMounted(path: String): Boolean {
-            val absolute = File(rootfsDir, path).absolutePath
-            return mounts.any { it.contains(" on $absolute ") }
-        }
-
-        mountIfNeeded("/dev", "--bind /dev") { isMounted("dev") }
-        mountIfNeeded("/dev/pts", "--bind /dev/pts") { isMounted("dev/pts") }
-        mountIfNeeded("/dev/shm", "-t tmpfs tmpfs") { isMounted("dev/shm") }
-        mountIfNeeded("/proc", "--bind /proc") { isMounted("proc") }
-        mountIfNeeded("/sys", "--bind /sys") { isMounted("sys") }
-        mountIfNeeded("/run", "-t tmpfs tmpfs") { isMounted("run") }
-        mountIfNeeded("/tmp", "-t tmpfs tmpfs") { isMounted("tmp") }
+        mountIfNeeded("/dev", "--bind /dev")
+        mountIfNeeded("/dev/pts", "--bind /dev/pts")
+        mountIfNeeded("/dev/shm", "-t tmpfs tmpfs")
+        mountIfNeeded("/proc", "--bind /proc")
+        mountIfNeeded("/sys", "--bind /sys")
+        mountIfNeeded("/run", "-t tmpfs tmpfs")
+        mountIfNeeded("/tmp", "-t tmpfs tmpfs")
 
         // Create runtime dirs after tmpfs is mounted
         execChroot("mkdir -p /tmp/.X11-unix /tmp/runtime-root /root")
     }
 
-    private fun mountIfNeeded(relative: String, mountArgs: String, alreadyMounted: () -> Boolean) {
-        if (alreadyMounted()) return
+    private fun mountIfNeeded(relative: String, mountArgs: String) {
         val target = File(rootfsDir, relative).absolutePath
-        try {
-            rootShell.exec("mkdir -p $target && mount $mountArgs $target")
+        val log = StringBuilder()
+        // Don't pre-check via string-matching `mount` output — that check
+        // was confirmed (via logcat) to always report a false "already
+        // mounted" positive on this device, silently skipping every mount.
+        // Just attempt it every time and trust the real exit code instead.
+        val exit = rootShell.exec(
+            "mkdir -p \"$target\" && mount $mountArgs \"$target\""
+        ) { chunk -> log.append(chunk) }
+        if (exit == 0) {
             Log.i(TAG, "Mounted $target")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to mount $target: ${e.message}")
+        } else {
+            Log.w(TAG, "Mount failed for $target (exit $exit): $log")
         }
     }
 
@@ -480,7 +480,8 @@ class ChrootRuntime(private val context: Context) {
      */
     fun executeCommand(command: String, onOutput: ((String) -> Unit)? = null): String {
         if (!hasRoot()) return "Error: root access required"
-        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; $command"
+        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; " +
+                "export TMPDIR=/tmp; export HOME=/root; $command"
         return if (onOutput != null) {
             val code = rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}") { chunk ->
                 onOutput(chunk)
@@ -492,8 +493,10 @@ class ChrootRuntime(private val context: Context) {
     }
 
     private fun execChroot(command: String, onLog: (String) -> Unit = {}): Int {
-        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; $command"
+        val wrapped = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; " +
+                "export TMPDIR=/tmp; export HOME=/root; $command"
         val output = rootShell.exec("chroot ${rootfsDir.absolutePath} /bin/bash -c ${shellQuote(wrapped)}") { chunk ->
+            Log.d(TAG, "OUT: $chunk")
             onLog(chunk)
         }
         Log.d(TAG, "chroot command exit code: $output")
