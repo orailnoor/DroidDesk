@@ -1,8 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// Optional release signing. Create android/key.properties (git-ignored) with
+// storeFile / storePassword / keyAlias / keyPassword to sign release builds with
+// a real upload key. If absent, release falls back to the debug key so
+// GitHub-distributed test APKs stay directly installable.
+val keystoreProperties = Properties()
+val keystorePropertiesFile = rootProject.file("key.properties")
+val hasReleaseKeystore = keystorePropertiesFile.exists().also {
+    if (it) keystorePropertiesFile.inputStream().use(keystoreProperties::load)
 }
 
 android {
@@ -12,6 +24,7 @@ android {
 
     buildFeatures {
         aidl = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -36,11 +49,27 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // GitHub-distributed testing builds intentionally use Android's
-            // debug key so release APKs are directly installable.
-            signingConfig = signingConfigs.getByName("debug")
+            // Use a real release key when key.properties is present; otherwise
+            // fall back to the debug key so GitHub-distributed test APKs remain
+            // directly installable.
+            signingConfig = if (hasReleaseKeystore) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

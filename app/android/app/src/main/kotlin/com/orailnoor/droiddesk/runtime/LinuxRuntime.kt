@@ -341,10 +341,15 @@ class LinuxRuntime(private val context: Context) {
 
     private fun extractZip(zipFile: File, destDir: File) {
         destDir.mkdirs()
+        val destRoot = destDir.canonicalPath + File.separator
         ZipInputStream(zipFile.inputStream()).use { zis ->
             var entry: ZipEntry? = zis.nextEntry
             while (entry != null) {
                 val outFile = File(destDir, entry.name)
+                // Zip-slip guard: reject any entry that resolves outside destDir.
+                if (!outFile.canonicalPath.startsWith(destRoot)) {
+                    throw SecurityException("Blocked path traversal in zip entry: ${entry.name}")
+                }
                 if (entry.isDirectory) {
                     outFile.mkdirs()
                 } else {

@@ -212,7 +212,9 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         const char *tmp_target = "/tmp/.X11-unix/X0";
         const char *new_prefix_tmp = getenv("TMPDIR");
         if (!new_prefix_tmp) new_prefix_tmp = NEW_PREFIX;
-        static char path_buf[256];
+        /* Stack-local, not static: connect() may run on multiple threads and a
+         * shared static buffer would race and corrupt the rewritten path. */
+        char path_buf[256];
         const char *new_path = NULL;
 
         if (strncmp(un.sun_path, termux_target, strlen(termux_target)) == 0) {

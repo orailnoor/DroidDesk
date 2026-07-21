@@ -7,6 +7,7 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
 import kotlin.concurrent.thread
 
@@ -41,6 +42,32 @@ class RootfsManager(private val context: Context) {
             "ubuntu" to "Ubuntu 24.04 Base",
             "alpine" to "Alpine Linux 3.20",
             "kali" to "Kali Linux (NetHunter Minimal)"
+        )
+
+        // Pinned SHA-256 of each rootfs tarball. The extracted rootfs is executed
+        // as root inside a chroot, so the download MUST be integrity-verified
+        // before extraction. A mismatch means the artifact was tampered with
+        // (MITM, hijacked/compromised mirror) and extraction is aborted.
+        //
+        // ubuntu/alpine point at fixed, versioned files, so their pins are stable.
+        // kali points at a rolling "current" image; its pin is verified primarily
+        // against the upstream SHA256SUMS (fetched over HTTPS), with the value
+        // below as the last-known-good fallback.
+        private val SHA256_PINS = mapOf(
+            "ubuntu" to "04207713ece899c3740823d33690441ad3a7f0ded1101aca744e2b0f37ac7ff2",
+            "alpine" to "83a79199bf3112c65e62ddf1732b051daf62ed2ddf5a8413c440dc25956116f0",
+            "kali" to "d6403a5da175df325611d23af4b92330856059c45454eced7f4cdf3ca6df2e4e"
+        )
+
+        // Upstream SHA256SUMS manifests (HTTPS) used as the source of truth for
+        // rolling releases when the hardcoded pin is stale.
+        private val SHA256SUMS_URLS = mapOf(
+            "ubuntu" to ("https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/SHA256SUMS"
+                to "ubuntu-base-24.04.4-base-arm64.tar.gz"),
+            "alpine" to ("https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.0-aarch64.tar.gz.sha256"
+                to "alpine-minirootfs-3.20.0-aarch64.tar.gz"),
+            "kali" to ("https://kali.download/nethunter-images/current/rootfs/SHA256SUMS"
+                to "kali-nethunter-rootfs-minimal-arm64.tar.xz")
         )
     }
 
@@ -130,7 +157,9 @@ class RootfsManager(private val context: Context) {
 
                 // Handle redirects or Already Satisfied (416)
                 if (connection.responseCode == 416) {
-                    // Already fully downloaded
+                    // Already fully downloaded — still verify integrity before trusting it.
+                    onProgress(0.99, "Verifying $distroName...")
+                    verifyChecksumOrThrow(distro, targetFile)
                     onProgress(1.0, "$distroName already downloaded")
                     configFile.writeText(distro)
                     return@thread
@@ -141,6 +170,11 @@ class RootfsManager(private val context: Context) {
                     connection.responseCode == HttpURLConnection.HTTP_SEE_OTHER) {
                     val redirectUrl = connection.getHeaderField("Location")
                     connection.disconnect()
+                    // Never follow a redirect that downgrades to cleartext HTTP; the
+                    // rootfs runs as root, so an http:// target would allow trivial MITM.
+                    if (redirectUrl == null || !redirectUrl.startsWith("https://")) {
+                        throw SecurityException("Refusing insecure redirect to: $redirectUrl")
+                    }
                     val newConnection = URL(redirectUrl).openConnection() as HttpURLConnection
                     if (downloadedBytes > 0) {
                         newConnection.setRequestProperty("Range", "bytes=$downloadedBytes-")
@@ -155,11 +189,17 @@ class RootfsManager(private val context: Context) {
                     downloadFromConnection(connection, targetFile, distroName, downloadedBytes, onProgress)
                 }
 
+                // Integrity gate: the tarball is about to be extracted and run as
+                // root, so verify it before trusting it. A failure deletes the file
+                // so the next attempt re-downloads from scratch.
+                onProgress(0.99, "Verifying $distroName...")
+                verifyChecksumOrThrow(distro, targetFile)
+
                 // Save distro selection
                 configFile.writeText(distro)
 
                 onProgress(1.0, "$distroName downloaded successfully")
-                Log.i(TAG, "Download complete: ${targetFile.absolutePath}")
+                Log.i(TAG, "Download complete and verified: ${targetFile.absolutePath}")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Download failed: ${e.message}", e)
@@ -239,8 +279,12 @@ class RootfsManager(private val context: Context) {
                 // Android's toybox includes tar, and we can use xz if available
                 val ext = if (distro == "kali") "xz" else "gz"
                 val tarFlags = if (ext == "xz") "Jxf" else "zxf"
+                // --no-same-owner: do not honor archived uid/gid.
+                // -P is intentionally NOT passed, so tar strips leading "/" and
+                // refuses "../" members, preventing path-traversal outside rootfs.
                 val process = ProcessBuilder(
                     "tar", tarFlags, tarball.absolutePath,
+                    "--no-same-owner",
                     "-C", rootfsDir.absolutePath
                 )
                     .redirectErrorStream(true)
@@ -464,6 +508,85 @@ class RootfsManager(private val context: Context) {
                 onProgress(-1.0, "Installation failed: ${e.message}")
             }
         }
+    }
+
+    // ── Integrity verification ──
+
+    /**
+     * Verify the downloaded tarball against a pinned SHA-256 (and, for rolling
+     * releases, the upstream SHA256SUMS manifest). Throws SecurityException and
+     * deletes the file on any mismatch — the artifact must never be extracted
+     * unverified because it is executed as root.
+     */
+    private fun verifyChecksumOrThrow(distro: String, file: File) {
+        if (!file.exists() || file.length() == 0L) {
+            throw SecurityException("Downloaded rootfs is missing or empty")
+        }
+
+        val actual = sha256Of(file)
+        val pinned = SHA256_PINS[distro]
+
+        if (pinned != null && actual.equals(pinned, ignoreCase = true)) {
+            Log.i(TAG, "Checksum OK (pinned) for $distro")
+            return
+        }
+
+        // Pin missing or stale (e.g. rolling "current" image) — fall back to the
+        // upstream HTTPS manifest as the source of truth.
+        val upstream = fetchUpstreamSha256(distro)
+        if (upstream != null && actual.equals(upstream, ignoreCase = true)) {
+            Log.w(TAG, "Checksum OK (upstream manifest) for $distro; hardcoded pin is stale")
+            return
+        }
+
+        file.delete()
+        throw SecurityException(
+            "Rootfs checksum verification FAILED for $distro. " +
+                "Expected ${pinned ?: upstream ?: "<unknown>"} but got $actual. " +
+                "The download was corrupted or tampered with and has been discarded."
+        )
+    }
+
+    private fun sha256Of(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(BUFFER_SIZE)
+            var read: Int
+            while (input.read(buffer).also { read = it } != -1) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Fetch the expected hash for [distro] from its upstream SHA256SUMS manifest
+     * over HTTPS. Returns null if unavailable. HTTPS-only; never follows a
+     * cleartext redirect.
+     */
+    private fun fetchUpstreamSha256(distro: String): String? {
+        val (sumsUrl, fileName) = SHA256SUMS_URLS[distro] ?: return null
+        return runCatching {
+            if (!sumsUrl.startsWith("https://")) return null
+            val conn = URL(sumsUrl).openConnection() as HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            conn.instanceFollowRedirects = false
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            conn.disconnect()
+            // Manifest lines look like: "<hash>  <filename>" (or a bare hash for
+            // single-file .sha256 manifests).
+            body.lineSequence()
+                .map { it.trim() }
+                .firstNotNullOfOrNull { line ->
+                    val hash = line.substringBefore(' ').substringBefore('\t').removePrefix("*")
+                    when {
+                        line.contains(fileName) -> line.substringBefore(' ').trim().removePrefix("*")
+                        line.isNotEmpty() && !line.contains(' ') && hash.length == 64 -> hash
+                        else -> null
+                    }
+                }
+        }.getOrNull()
     }
 
     // ── Utility ──

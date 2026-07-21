@@ -10,6 +10,7 @@ import android.os.PowerManager
 import android.content.Context
 import android.net.Uri
 import android.provider.Settings
+import com.orailnoor.droiddesk.BuildConfig
 import com.orailnoor.droiddesk.service.DroidDeskService
 import com.orailnoor.droiddesk.runtime.LinuxRuntime
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
@@ -35,14 +36,18 @@ class MainActivity : FlutterActivity() {
         linuxRuntime = LinuxRuntime(this)
         chrootRuntime = ChrootRuntime(this)
 
-        if (intent.getBooleanExtra("autoSetup", false)) {
+        // Developer/auto-tester path only. MainActivity is exported (it is the
+        // launcher), so honoring this extra in release builds would let any
+        // third-party app drive the privileged root-setup pipeline. Restrict it
+        // to debug builds.
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("autoSetup", false)) {
             runAutoChrootSetup()
         }
     }
 
     /**
      * Hidden developer/auto-tester path: download, extract, install, and launch
-     * the chroot desktop without any Flutter UI interaction.
+     * the chroot desktop without any Flutter UI interaction. Debug builds only.
      */
     private fun runAutoChrootSetup() {
         thread(name = "auto-chroot-setup") {
