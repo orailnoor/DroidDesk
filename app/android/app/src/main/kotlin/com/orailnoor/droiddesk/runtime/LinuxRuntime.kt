@@ -92,7 +92,7 @@ class LinuxRuntime(private val context: Context) {
     private fun hasAdrenoGpu(): Boolean = File("/dev/kgsl-3d0").exists()
 
     private fun normalizedDesktop(desktopEnv: String): String = when (desktopEnv.lowercase()) {
-        "lxqt", "mate", "kde", "xfce4" -> desktopEnv.lowercase()
+        "lxqt", "mate", "kde", "xfce4", "openbox" -> desktopEnv.lowercase()
         else -> "xfce4"
     }
 
@@ -265,9 +265,20 @@ class LinuxRuntime(private val context: Context) {
         }
         prefixDir.mkdirs()
 
+        // Pick the bootstrap matching the device's primary ABI. 32-bit-only
+        // systems (armeabi-v7a) get the Termux `arm` bootstrap; everything else
+        // uses the aarch64 bootstrap.
+        val primaryAbi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        val bootstrapZip = if (primaryAbi == "armeabi-v7a" || primaryAbi == "armeabi") {
+            "bootstrap-arm.zip"
+        } else {
+            "bootstrap-aarch64.zip"
+        }
+        Log.i(TAG, "Selected bootstrap $bootstrapZip for ABI $primaryAbi")
+
         // Flutter assets are located under "flutter_assets/" in the APK asset tree
-        val assetName = "flutter_assets/assets/bootstrap-aarch64.zip"
-        val tmpZip = File(tmpDir, "bootstrap-aarch64.zip")
+        val assetName = "flutter_assets/assets/$bootstrapZip"
+        val tmpZip = File(tmpDir, bootstrapZip)
         tmpZip.parentFile?.mkdirs()
 
         try {
@@ -293,9 +304,15 @@ class LinuxRuntime(private val context: Context) {
         // Ensure apt cache/state directories exist (bootstrap zip may omit empty dirs)
         ensureAptDirectories()
 
-        // Set executable permissions on binaries
+        // Set executable permissions on binaries. The zip is extracted without
+        // preserving unix modes, so every executable tree must be restored
+        // explicitly. apt's download transports live under lib/apt/methods and
+        // are exec'd by apt directly — without +x they die with
+        // "Method https has died unexpectedly" during repo configuration.
         setExecutableRecursively(binDir)
         setExecutableRecursively(File(prefixDir, "libexec"))
+        setExecutableRecursively(File(prefixDir, "lib/apt/methods"))
+        setExecutableRecursively(File(prefixDir, "share/apt"))
 
         // Wrap dpkg so it and its children (e.g. dpkg-split) always see the right PATH/env
         wrapDpkgForPath()
@@ -1332,12 +1349,22 @@ class LinuxRuntime(private val context: Context) {
         onProgress?.invoke(0.46, "Installing $selectedDesktop desktop packages...")
 
         val desktopPackages = when (selectedDesktop) {
+            // Minimal WM for low-RAM devices (e.g. Samsung Galaxy A10s, 2 GB):
+            // a bare window manager, panel, file manager and terminal only.
+            "openbox" -> "openbox tint2 pcmanfm xterm feh"
             "lxqt" -> "lxqt qterminal pcmanfm-qt featherpad"
             "mate" -> "mate mate-terminal"
             "kde" -> "plasma-desktop konsole dolphin"
             else -> "xfce4 xfce4-terminal xfce4-whiskermenu-plugin xfce4-notifyd thunar mousepad"
         }
-        if (!installPackageGroup("pkg install -y $desktopPackages")) {
+        // Use --no-install-recommends: Termux's openbox/xfce recommends pull in
+        // large unrelated packages (games, dev IDEs, python-tkinter, mesa-dev)
+        // that bloat the install and, on 2 GB devices like the Galaxy A10s,
+        // drive the memory pressure that gets the app LMKD-killed mid-setup.
+        if (!installPackageGroup(
+                "apt-get install -y --no-install-recommends $desktopPackages",
+            )
+        ) {
             Log.e(TAG, "$selectedDesktop package install failed")
             return false
         }
@@ -1366,7 +1393,10 @@ class LinuxRuntime(private val context: Context) {
             0.84,
             "Installing Desktop Essentials tools...",
         )
-        if (!installPackageGroup("pkg install -y $nativeTools")) {
+        if (!installPackageGroup(
+                "apt-get install -y --no-install-recommends $nativeTools",
+            )
+        ) {
             Log.e(TAG, "Native Termux utility package install failed")
             return false
         }
@@ -1466,6 +1496,8 @@ class LinuxRuntime(private val context: Context) {
                     ".local/share/backgrounds/droiddesk-ubuntu-touch.jpg",
                 ),
             )
+        } else if (selectedDesktop == "openbox") {
+            OpenboxMobileProfile.install(homeDir.apply { mkdirs() })
         }
 
         // X11ServerService owns this socket. Never delete it from the client runtime.
@@ -1545,6 +1577,7 @@ class LinuxRuntime(private val context: Context) {
         }
 
         val desktopCommand = when (selectedDesktop) {
+            "openbox" -> "openbox-session"
             "lxqt" -> "startlxqt"
             "mate" -> "mate-session"
             "kde" -> "startplasma-x11"

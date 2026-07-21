@@ -31,8 +31,10 @@ android {
         versionName = flutter.versionName
 
         ndk {
-            // ARM64 only — all modern Android phones
-            abiFilters += listOf("arm64-v8a")
+            // arm64-v8a for modern phones; armeabi-v7a for older 32-bit-only
+            // Android systems (e.g. some Samsung Galaxy A10s / SM-A107F units
+            // that ship a 32-bit OS despite a 64-bit-capable SoC).
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
     }
 

@@ -63,11 +63,27 @@ class X11InputController(private val lorieView: LorieView) {
     companion object {
         const val DISPLAY_SCALE_PERCENT = 200
 
+        /**
+         * In "scaled" mode the render resolution is surface*100/scale, so a
+         * larger percent means a smaller (blurrier) backing store. 300 rendered
+         * a 720x1520 panel at only 240x506 — far too blocky. Openbox is light
+         * enough to render at native resolution (100) even on a 2 GB A10s, so
+         * low-RAM devices now get full sharpness.
+         */
+        const val DISPLAY_SCALE_PERCENT_LOW_RAM = 100
+
         /** Must run before LorieView is measured so Xwayland starts at the scaled resolution. */
-        fun configureDisplayScale() {
+        fun configureDisplayScale(context: android.content.Context) {
+            val scale = if (
+                com.orailnoor.droiddesk.runtime.DeviceProfile.isLowRam(context)
+            ) {
+                DISPLAY_SCALE_PERCENT_LOW_RAM
+            } else {
+                DISPLAY_SCALE_PERCENT
+            }
             MainActivity.getPrefs().apply {
                 displayResolutionMode.put("scaled")
-                displayScale.put(DISPLAY_SCALE_PERCENT)
+                displayScale.put(scale)
                 displayStretch.put(true)
                 scaleTouchpad.put(true)
             }

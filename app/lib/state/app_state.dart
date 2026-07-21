@@ -11,6 +11,7 @@ class AppState extends ChangeNotifier {
   String _installedDE = '';
   String _selectedDistro = 'ubuntu';
   String _selectedDE = 'xfce4';
+  bool _deExplicitlyChosen = false;
   int _setupStep = 0; // 0=welcome, 1=distro, 2=de, 3=install, 4=done
 
   // ── Download/Install Progress ──
@@ -49,7 +50,9 @@ class AppState extends ChangeNotifier {
   String get installedDistro => _installedDistro;
   String get installedDE => _installedDE;
   String get selectedDistro => _selectedDistro;
-  String get selectedDE => _selectedDE;
+  // Once a desktop is installed, it is the source of truth everywhere (labels,
+  // status, launch). Before install, fall back to the picker selection.
+  String get selectedDE => _installedDE.isNotEmpty ? _installedDE : _selectedDE;
   int get setupStep => _setupStep;
   double get downloadProgress => _downloadProgress;
   String get downloadStatus => _downloadStatus;
@@ -78,6 +81,20 @@ class AppState extends ChangeNotifier {
     if (vendor.contains('mali')) return 'Mali (MediaTek/Exynos)';
     if (vendor.contains('powervr')) return 'PowerVR';
     return 'Unknown GPU';
+  }
+
+  int get totalRamMB {
+    final ram = _deviceInfo['totalRamMB'];
+    if (ram is int) return ram;
+    return int.tryParse('$ram') ?? 0;
+  }
+
+  /// Devices with ~3 GB or less RAM (e.g. Samsung Galaxy A10s, 2 GB) run the
+  /// lightweight Openbox profile at a lower resolution by default. 0 means the
+  /// device info has not loaded yet, which we treat as a normal device.
+  bool get isLowRamDevice {
+    final ram = totalRamMB;
+    return ram > 0 && ram <= 3072;
   }
 
   // ── Initialization ──
@@ -189,6 +206,13 @@ class AppState extends ChangeNotifier {
   Future<void> loadDeviceInfo() async {
     try {
       _deviceInfo = await DroidDeskPlatform.getDeviceInfo();
+      // On a fresh low-RAM device, default to the lightweight Openbox desktop.
+      // Never override an explicit user choice or an already-installed desktop.
+      if (!_deExplicitlyChosen &&
+          _installedDE.isEmpty &&
+          isLowRamDevice) {
+        _selectedDE = 'openbox';
+      }
       notifyListeners();
     } catch (e) {
       // Non-fatal — continue without device info
@@ -204,6 +228,7 @@ class AppState extends ChangeNotifier {
 
   void setSelectedDE(String de) {
     _selectedDE = de;
+    _deExplicitlyChosen = true;
     notifyListeners();
   }
 
@@ -386,8 +411,13 @@ class AppState extends ChangeNotifier {
   }) async {
     try {
       _errorMessage = null;
+      // Launch the desktop that is actually installed. The picker default
+      // (_selectedDE) may differ from what was installed — e.g. on a low-RAM
+      // device that installed Openbox — and starting the wrong one tries to
+      // (re)install it and fails.
+      final launchDE = _installedDE.isNotEmpty ? _installedDE : _selectedDE;
       final started = await DroidDeskPlatform.startLinux(
-        de: _selectedDE,
+        de: launchDE,
         mode: mode,
         width: width,
         height: height,
