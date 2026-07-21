@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Legacy (Android < 12) backup rules. The app runs a root desktop; its
+    private state (rootfs, distro/DE config, prefix) must not leave the device
+    via adb backup. allowBackup is already false, so this is defense in depth.
+-->
+<full-backup-content>
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+</full-backup-content>

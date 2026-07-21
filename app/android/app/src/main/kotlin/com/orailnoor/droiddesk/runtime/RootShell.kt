@@ -97,9 +97,17 @@ class RootShell(private val context: Context) {
 
     /**
      * Run a command inside the chroot rootfs as root.
+     *
+     * [command] is passed as a single safely-quoted argument to bash, so a
+     * command containing quotes cannot break out of or inject into the wrapper.
      */
     fun execInChroot(rootfs: File, command: String): String {
-        return exec("chroot ${rootfs.absolutePath} /bin/bash -c '$command'")
+        return exec("chroot ${rootfs.absolutePath} /bin/bash -c ${shellQuote(command)}")
+    }
+
+    /** Wrap [input] as a single-quoted shell token, escaping embedded quotes. */
+    private fun shellQuote(input: String): String {
+        return "'" + input.replace("'", "'\"'\"'") + "'"
     }
 
     /**

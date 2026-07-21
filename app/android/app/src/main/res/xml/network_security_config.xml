@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The app's own HttpURLConnection traffic (rootfs downloads, checksum
+    manifests) must be HTTPS. Cleartext is denied by default. apt traffic
+    inside the chroot comes from the chroot's own binaries (not this app) and
+    is protected by apt's GPG package signing, so it is unaffected by this file.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
