@@ -117,7 +117,7 @@ class DesktopActivity : Activity() {
 
     private fun setupLorieView() {
         Log.i(TAG, "Setting up LorieView")
-        X11InputController.configureDisplayScale()
+        X11InputController.configureDisplayScale(this)
         TermuxMainActivity.getInstance().initLorieView(this)
         lorieView = TermuxMainActivity.getInstance().lorieView
 

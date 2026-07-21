@@ -7,7 +7,7 @@ import java.io.File
 /** Installs DroidDesk's touch-friendly Ubuntu-inspired XFCE defaults once per home. */
 object XfceMobileProfile {
     private const val TAG = "XfceMobileProfile"
-    private const val PROFILE_MARKER = ".droiddesk-xfce-mobile-v5"
+    private const val PROFILE_MARKER = ".droiddesk-xfce-mobile-v6"
     private const val WALLPAPER_ASSET = "droiddesk/ubuntu-touch-wallpaper.jpg"
 
     fun install(
@@ -33,6 +33,10 @@ object XfceMobileProfile {
             File(xfconfDir, "xfce4-desktop.xml").writeText(
                 desktopConfig(xmlEscape(wallpaperPathInSession)),
             )
+            // DroidDesk renders through llvmpipe/Zink; the xfwm4 compositor
+            // costs more than it is worth here, so disable it for smoother
+            // window dragging on low-end GPUs.
+            File(xfconfDir, "xfwm4.xml").writeText(xfwm4Config())
             installPanelCss(homeDir)
 
             val panelDir = File(homeDir, ".config/xfce4/panel")
@@ -223,6 +227,16 @@ object XfceMobileProfile {
               <property name="style" type="uint" value="0"/>
             </property>
             <property name="plugin-25" type="string" value="showdesktop"/>
+          </property>
+        </channel>
+    """.trimIndent() + "\n"
+
+    private fun xfwm4Config(): String = """
+        <?xml version="1.1" encoding="UTF-8"?>
+
+        <channel name="xfwm4" version="1.0">
+          <property name="general" type="empty">
+            <property name="use_compositing" type="bool" value="false"/>
           </property>
         </channel>
     """.trimIndent() + "\n"

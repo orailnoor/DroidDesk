@@ -11,6 +11,16 @@ class DEPickerScreen extends StatelessWidget {
 
   static const _desktops = [
     _DEOption(
+      id: 'openbox',
+      name: 'Openbox (Lite)',
+      description:
+          'Minimal window manager with a panel. Best for 2–3 GB devices.',
+      ram: '~120 MB RAM',
+      icon: Icons.crop_square_rounded,
+      color: Color(0xFF4CAF50),
+      recommended: false,
+    ),
+    _DEOption(
       id: 'xfce4',
       name: 'XFCE4',
       description:
@@ -114,6 +124,42 @@ class DEPickerScreen extends StatelessWidget {
                       ],
                     ),
                   ).animate().fadeIn(delay: 200.ms, duration: 400.ms),
+                ],
+
+                // ── Low-RAM Lite-mode recommendation ──
+                if (state.isLowRamDevice) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF4CAF50).withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: const Color(0xFF4CAF50).withValues(alpha: 0.4),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.bolt_rounded,
+                          size: 16,
+                          color: Color(0xFF4CAF50),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Low RAM detected. Openbox (Lite) is recommended '
+                            'and renders at a lower resolution for smoother '
+                            'performance.',
+                            style: DroidTheme.bodySm,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ).animate().fadeIn(delay: 250.ms, duration: 400.ms),
                 ],
 
                 const SizedBox(height: 24),

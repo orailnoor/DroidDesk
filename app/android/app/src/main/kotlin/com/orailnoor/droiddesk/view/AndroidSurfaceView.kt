@@ -25,7 +25,7 @@ class AndroidSurfaceView(
     }
 
     init {
-        X11InputController.configureDisplayScale()
+        X11InputController.configureDisplayScale(context)
         MainActivity.getInstance().initLorieView(context)
         lorieView = MainActivity.getInstance().lorieView
         lorieView.setBackgroundColor(Color.TRANSPARENT)

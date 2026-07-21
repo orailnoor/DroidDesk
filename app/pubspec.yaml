@@ -34,6 +34,7 @@ flutter:
   assets:
     - assets/icons/logo.png
     - assets/bootstrap-aarch64.zip
+    - assets/bootstrap-arm.zip
     - assets/socket_hook.c
 
   fonts:
