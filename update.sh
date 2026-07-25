@@ -5,9 +5,9 @@
 #  wiping your config: it keeps your XFCE theme, wallpaper,
 #  VNC setup, Proot data, username and SD-card storage choice.
 #  It refreshes packages and regenerates the helper scripts
-#  (start-x11.sh, chromium.sh, app-installer.sh, click-n-run.sh,
-#  anti-oom.sh, fix-proot.sh, proot-menu-sync.sh, stop-linux.sh,
-#  update.sh).
+#  (start-x11.sh, chromium.sh, ram-manager.sh, lock-screen.sh,
+#  power-menu.sh, device-info.sh, fix-proot.sh, proot-menu-sync.sh,
+#  stop-linux.sh, update.sh).
 # ============================================================
 set -u
 
@@ -29,8 +29,9 @@ echo -e "${GREEN}[*] Backing up your config to:${NC}"
 echo -e "    $BACKUP_DIR"
 for item in .config/xfce4 .config/linux-wallpaper.jpg .config/linux-gpu.sh \
             .vnc start-x11.sh start-vnc.sh start-proot.sh \
-            chromium.sh helium.sh app-installer.sh click-n-run.sh \
-            anti-oom.sh fix-proot.sh \
+            chromium.sh helium.sh \
+            ram-manager.sh lock-screen.sh power-menu.sh device-info.sh \
+            fix-proot.sh \
             proot-menu-sync.sh stop-linux.sh update.sh Desktop; do
     if [ -e "$HOME/$item" ]; then
         mkdir -p "$BACKUP_DIR/$(dirname "$item")"

@@ -421,12 +421,58 @@ step_apps() {
     install_pkg "htop" "htop"
     install_pkg "xdotool"
 
-    # Native Firefox (runs in Termux, no proot) + zenity for the visual
-    # .deb/AppImage installer.
+    # Native Firefox (runs in Termux, no proot)
     install_pkg "firefox" "Firefox"
-    install_pkg "zenity" "Zenity (installer dialogs)"
     install_pkg "xfce4-goodies" "XFCE4 Goodies (Basic apps)"
     install_pkg "libnotify" "libnotify (desktop notifications)"
+    install_pkg "procps" "procps (ps/pkill/kill for RAM mgr)"
+    install_pkg "zenity" "Zenity (power/info dialogs)"
+
+    # Configure Firefox for 1GB RAM + Adreno GPU + Zink/VA-API offload
+    FIREFOX_DIR="${TERMUX_PREFIX}/lib/firefox"
+    FIREFOX_PREFS="${HOME}/.mozilla/firefox/*.default-release/prefs.js"
+    mkdir -p "$(dirname "$FIREFOX_PREFS")" 2>/dev/null || true
+
+    cat > ~/.mozilla/firefox/pnoroot-gpu-prefs.js << 'FFEOF'
+// P-noroot linux: Firefox tuned for 1GB RAM + Adreno GPU + Zink/VA-API
+user_pref("browser.sessionstore.restore_pinned_tabs_on_demand", true);
+user_pref("browser.sessionstore.restore_on_demand", true);
+user_pref("browser.sessionstore.max_tabs_undo", 2);
+user_pref("browser.sessionstore.interval", 30000);
+user_pref("browser.discovery.enabled", false);
+user_pref("browser.newtabpage.enabled", false);
+user_pref("browser.onboarding.enabled", false);
+user_pref("browser.aboutConfig.showWarning", false);
+user_pref("browser.tabs.remote.autostart", true);
+user_pref("browser.tabs.unloadOnLowMemory", true);
+user_pref("browser.tabs.min_inactive_duration_before_unload", 30000);
+user_pref("browser.memory.low_pri_space_threshold_percent", 70);
+user_pref("browser.memory.high_pri_space_threshold_percent", 60);
+user_pref("browser.memory.low_commit_space_threshold_percent", 80);
+user_pref("browser.memory.high_commit_space_threshold_percent", 70);
+user_pref("browser.tabs.load_delay_limit", 2);
+user_pref("browser.tabs.load_in_background", false);
+user_pref("browser.cache.disk.enable", false);
+user_pref("browser.cache.memory.enable", true);
+user_pref("browser.cache.memory.capacity", 32768);
+user_pref("media.cache_size", 51200);
+user_pref("browser.display.use_document_fonts", 0);
+user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.compositor", true);
+user_pref("layers.acceleration.force-enabled", true);
+user_pref("layers.acceleration.disabled", false);
+user_pref("gfx.canvas.accelerated.cache-size", 512);
+user_pref("gfx.content.opaque-background-color", true);
+user_pref("gfx.color-management.enabled", false);
+user_pref("gfx.font-rendering.cleartype_params.rendering_mode", 2);
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.dns.disablePrefetchHTTPS", true);
+user_pref("network.http.max-connections", 32);
+user_pref("network.http.max-persistent-connections-per-server", 4);
+user_pref("network.http.max-persistent-connections-per-proxy", 2);
+user_pref("network.http.spdy.enabled.v3-1", false);
+FFEOF
+    echo -e "  [+] Firefox configured: GPU HW accel + 1GB RAM tuned"
 
     # Force-install uBlock Origin (Lite, MV3 — required by modern Chromium)
     # via Chromium's managed policy so it ships preinstalled and enabled.
@@ -578,8 +624,7 @@ step_proot() {
     fi
 
     # The browser is native Chromium in Termux (installed in step_apps); the
-    # Proot container is now only a hidden glibc backend used by the visual
-    # .deb / AppImage installer (~/app-installer.sh).
+    # Proot container is used only for proot-menu-sync (app menu bridge).
 
     PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
     TERMUX_VK_ICD="/data/data/com.termux/files/usr/share/vulkan/icd.d"
@@ -647,186 +692,72 @@ CHROMEEOF
     chmod +x ~/chromium.sh
     echo -e "  [+] Created ~/chromium.sh (native Chromium launcher)"
 
-    # ---- app-installer.sh (visual .deb / AppImage installer) ----
-    # Uses the Proot container purely as a hidden glibc backend so users can
-    # install real desktop .deb / AppImage apps with a GUI; installed apps then
-    # show up in the XFCE menu via proot-menu-sync.sh.
-    cat > ~/app-installer.sh << 'APPINSTEOF'
+    # ---- ram-manager.sh (lightweight RAM cleaner for low-memory devices) ----
+    # Frees background/cache/idle processes WITHOUT killing foreground apps,
+    # browser, desktop, audio, or proot. This is the new light RAM Manager.
+    cat > ~/ram-manager.sh << 'RMEOF'
 #!/data/data/com.termux/files/usr/bin/bash
-export PROOT_NO_SECCOMP=1
-PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
-PROOT_BIN="$PREFIX_DIR/bin/proot-distro"
-DISTRO="ubuntu"
-export DISPLAY=:0
+# P-noroot linux — RAM Manager
+# Designed for 1GB RAM devices. Runs every 30s, frees idle/cache only.
+# Never kills: XFCE, Firefox, Chromium, Termux-X11, PulseAudio, foreground apps.
 
-die(){ zenity --error --width=360 --text="$1" 2>/dev/null; exit 1; }
+INTERVAL="${RNGR_INTERVAL:-30}"
+LOW_PCT="${RNGR_LOW_PCT:-20}"
+CRIT_PCT="${RNGR_CRIT_PCT:-10}"
 
-command -v zenity >/dev/null 2>&1 || { echo "[!] zenity not installed."; exit 1; }
-[ -x "$PROOT_BIN" ] || die "proot-distro not found."
-"$PROOT_BIN" login "$DISTRO" -- true >/dev/null 2>&1 || \
-    die "The Linux backend is not installed. Re-run the setup first."
+SAFE_FOREGROUND='thunar|xfce4-terminal|xfce4-session|xfwm4|xfce4-panel|xfdesktop|pulseaudio|dbus-daemon|termux-x11|Xwayland|startxfce4|plasmashell|kwin_x11|mate-session|marco|startlxqt|xfce4-keyboard|xfce4-notifyd'
 
-FILE=$(zenity --file-selection \
-    --title="Select a .deb or .AppImage to install" \
-    --file-filter="Linux apps | *.deb *.AppImage *.appimage" \
-    --file-filter="All files | *" 2>/dev/null)
-[ -z "$FILE" ] && exit 0
-[ -f "$FILE" ] || die "File not found."
+notify(){ command -v notify-send >/dev/null 2>&1 && notify-send -u normal "P-noroot linux" "$1" 2>/dev/null; }
 
-BASE=$(basename "$FILE")
-LOG=$(mktemp "${TMPDIR:-$PREFIX_DIR/tmp}/appinst.XXXXXX.log")
+is_foreground(){
+    local pid="$1"
+    local fg=""
+    fg=$(cat /proc/$pid/status 2>/dev/null | grep -E '^State:' | awk '{print $2}')
+    [ "$fg" = "R" ] || [ "$fg" = "D" ] || [ "$fg" = "S" ] && return 0
+    return 1
+}
 
-case "$BASE" in
-    *.deb)
-        (
-        "$PROOT_BIN" login "$DISTRO" --bind "$FILE:/tmp/pkg.deb" -- bash -c '
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y -q
-            apt-get install -y -q /tmp/pkg.deb || { dpkg -i /tmp/pkg.deb; apt-get -f install -y -q; }
-        ' > "$LOG" 2>&1
-        ) | zenity --progress --pulsate --auto-close --no-cancel \
-                --title="Installing $BASE" \
-                --text="Installing .deb inside the Linux backend..." 2>/dev/null
-        ;;
-    *.AppImage|*.appimage)
-        NAME=$(printf '%s' "$BASE" | sed 's/\.[Aa]pp[Ii]mage$//')
-        (
-        "$PROOT_BIN" login "$DISTRO" --bind "$FILE:/tmp/app.AppImage" -- \
-            env APPNAME="$NAME" bash -c '
-            set -e
-            APPDIR="/opt/appimages/$APPNAME"
-            rm -rf "$APPDIR"; mkdir -p "$APPDIR"; cd "$APPDIR"
-            cp /tmp/app.AppImage ./app.AppImage; chmod +x ./app.AppImage
-            # AppImages need FUSE (absent under proot) -> extract instead.
-            ./app.AppImage --appimage-extract >/dev/null 2>&1
-            RUN="$APPDIR/squashfs-root/AppRun"
-            ICON=$(find "$APPDIR/squashfs-root" -maxdepth 2 -iname "*.png" | head -n1)
-            mkdir -p /usr/share/applications
-            printf "[Desktop Entry]\nName=%s\nExec=%s %%U\nIcon=%s\nType=Application\nTerminal=false\n" \
-                "$APPNAME" "$RUN" "$ICON" > "/usr/share/applications/$APPNAME.desktop"
-        ' > "$LOG" 2>&1
-        ) | zenity --progress --pulsate --auto-close --no-cancel \
-                --title="Installing $BASE" \
-                --text="Extracting AppImage inside the Linux backend..." 2>/dev/null
-        ;;
-    *)
-        die "Unsupported file. Choose a .deb or .AppImage."
-        ;;
-esac
+free_cache(){
+    command -v logcat >/dev/null 2>&1 && logcat -c >/dev/null 2>&1 || true
+}
 
-# Refresh the XFCE menu bridge so the new app shows up.
-[ -f "$HOME/proot-menu-sync.sh" ] && bash "$HOME/proot-menu-sync.sh" >/dev/null 2>&1
-
-if tail -n 25 "$LOG" 2>/dev/null | grep -qiE 'error|no installation candidate|unable to locate|failed|cannot'; then
-    zenity --text-info --width=600 --height=380 \
-        --title="Install finished (with warnings)" --filename="$LOG" 2>/dev/null
-else
-    zenity --info --width=360 \
-        --text="$BASE installed. Look for it in the application menu." 2>/dev/null
-fi
-rm -f "$LOG"
-APPINSTEOF
-    chmod +x ~/app-installer.sh
-    echo -e "  [+] Created ~/app-installer.sh (visual .deb/AppImage installer)"
-
-    # ---- click-n-run.sh (visual Termux "app store") ----
-    # Search the Termux package index and install native apps with a GUI.
-    cat > ~/click-n-run.sh << 'CNREOF'
-#!/data/data/com.termux/files/usr/bin/bash
-export DISPLAY=:0
-command -v zenity >/dev/null 2>&1 || { echo "[!] zenity not installed."; exit 1; }
-
-while :; do
-    QUERY=$(zenity --entry --width=440 \
-        --title="Click n run — Termux App Store" \
-        --text="Search for an app or package (name or keyword):" 2>/dev/null) || exit 0
-    [ -z "$QUERY" ] && continue
-
-    RESULTS=$(apt-cache search "$QUERY" 2>/dev/null | sort -f | head -n 200)
-    if [ -z "$RESULTS" ]; then
-        zenity --info --width=360 --text="No packages match \"$QUERY\"." 2>/dev/null
-        continue
-    fi
-
-    SEL=$(printf '%s\n' "$RESULTS" \
-        | sed -E 's/ - / \t/' \
-        | awk -F'\t' '{print $1; print $2}' \
-        | zenity --list --width=700 --height=480 \
-            --title="Results for \"$QUERY\"" \
-            --column="Package" --column="Description" 2>/dev/null) || continue
-    [ -z "$SEL" ] && continue
-
-    ( apt-get install -y "$SEL" 2>&1 ) \
-        | zenity --progress --pulsate --auto-close --no-cancel \
-            --title="Installing $SEL" --text="Installing $SEL ..." 2>/dev/null
-
-    if command -v "$SEL" >/dev/null 2>&1 || dpkg -s "$SEL" >/dev/null 2>&1; then
-        MSG="$SEL installed. GUI apps appear in the menu automatically."
-    else
-        MSG="Could not confirm $SEL installed. Check the name and try again."
-    fi
-    zenity --question --width=380 \
-        --text="$MSG\n\nSearch for another app?" 2>/dev/null || exit 0
-done
-CNREOF
-    chmod +x ~/click-n-run.sh
-    echo -e "  [+] Created ~/click-n-run.sh (Click n run app store)"
-
-    # ---- anti-oom.sh (low-memory guard) ----
-    # Non-rooted Android cannot enable swap/zram (they need root), so instead
-    # of letting Android kill everything when RAM runs out, this frees memory
-    # by closing the single heaviest non-critical app.
-    cat > ~/anti-oom.sh << 'OOMEOF'
-#!/data/data/com.termux/files/usr/bin/bash
-LOW_PCT="${ANTIOOM_LOW_PCT:-10}"
-CRIT_PCT="${ANTIOOM_CRIT_PCT:-5}"
-INTERVAL="${ANTIOOM_INTERVAL:-5}"
-
-notify(){ command -v notify-send >/dev/null 2>&1 && notify-send -u critical "P-noroot linux" "$1" 2>/dev/null; }
-
-# Never kill these (desktop/session critical).
-SAFE='init|login|bash|/sh|xfce4-session|xfwm4|xfsettingsd|xfce4-panel|xfdesktop|thunar|termux-x11|Xwayland|pulseaudio|dbus|anti-oom|proot-menu|start-x11'
-
-biggest_victim(){
-    local best_pid="" best_rss=0 pid rss comm
+kill_idle_heavy(){
+    local best_pid="" best_rss=0
     for d in /proc/[0-9]*; do
         pid="${d#/proc/}"
         [ -r "$d/statm" ] || continue
         rss=$(awk '{print $2}' "$d/statm" 2>/dev/null)
         [ -n "$rss" ] || continue
         comm=$(tr -d '\0' < "$d/cmdline" 2>/dev/null); [ -n "$comm" ] || comm=$(cat "$d/comm" 2>/dev/null)
-        printf '%s' "$comm" | grep -qiE "$SAFE" && continue
+        printf '%s' "$comm" | grep -qiE "$SAFE_FOREGROUND" && continue
+        printf '%s' "$comm" | grep -qiE 'firefox|chromium|chrome|brave|chrome-sandbox' && continue
+        printf '%s' "$comm" | grep -qiE 'Termux|termux|applets' && continue
+        is_foreground "$pid" && continue
         if [ "$rss" -gt "$best_rss" ]; then best_rss="$rss"; best_pid="$pid"; fi
     done
-    printf '%s' "$best_pid"
+    if [ -n "$best_pid" ] && [ "$best_rss" -gt 4096 ]; then
+        name=$(cat "/proc/$best_pid/comm" 2>/dev/null)
+        kill "$best_pid" 2>/dev/null || kill -9 "$best_pid" 2>/dev/null || true
+        sleep 1
+        notify "RAM Manager: freed ${name:-a process} (${best_rss} KB)"
+    fi
 }
 
-low_warned=0
 while :; do
     total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
     avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
     if [ -n "$total" ] && [ -n "$avail" ] && [ "$total" -gt 0 ]; then
         pct=$(( avail * 100 / total ))
         if [ "$pct" -le "$CRIT_PCT" ]; then
-            victim=$(biggest_victim)
-            if [ -n "$victim" ]; then
-                name=$(cat "/proc/$victim/comm" 2>/dev/null)
-                notify "Low RAM (${pct}% free). Closing ${name:-an app} to recover."
-                kill -9 "$victim" 2>/dev/null
-                sleep 2
-            fi
-        elif [ "$pct" -le "$LOW_PCT" ]; then
-            [ "$low_warned" -eq 0 ] && notify "RAM low (${pct}% free). Consider closing some apps."
-            low_warned=1
-        else
-            low_warned=0
+            free_cache
+            kill_idle_heavy
         fi
     fi
     sleep "$INTERVAL"
 done
-OOMEOF
-    chmod +x ~/anti-oom.sh
-    echo -e "  [+] Created ~/anti-oom.sh (low-memory guard)"
+RMEOF
+    chmod +x ~/ram-manager.sh
+    echo -e "  [+] Created ~/ram-manager.sh (lightweight RAM Manager)"
 
     # ---- fix-proot.sh (diagnose & repair the hidden backend) ----
     # Prints the diagnostics we used to ask for by hand, repairs a dangling SD
@@ -1007,6 +938,14 @@ echo "    X11=\$X11_DIR  BINDS=\$BINDS"
 export DISPLAY=:0
 export XDG_RUNTIME_DIR=/tmp
 export MESA_NO_ERROR=1
+export MESA_GL_VERSION_OVERRIDE=4.6
+export MESA_GLES_VERSION_OVERRIDE=3.2
+export GALLIUM_DRIVER=zink
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export TU_DEBUG=noconform
+export MESA_VK_WSI_PRESENT_MODE=immediate
+export ZINK_DESCRIPTORS=lazy
+export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
 $EXTRA_ENV
 dbus-run-session $APP_CMD
 "
@@ -1076,6 +1015,75 @@ export XDG_DATA_DIRS=/data/data/com.termux/files/usr/share:\${XDG_DATA_DIRS}
 export XDG_CONFIG_DIRS=/data/data/com.termux/files/usr/etc/xdg:\${XDG_CONFIG_DIRS}
 EOF
 
+    # Firefox RAM/GPU wrapper: launches Firefox with forced GPU + low-memory prefs
+    mkdir -p ~/.mozilla/firefox
+    cat > ~/.mozilla/firefox/pnoroot-gpu-prefs.js << 'FFEOF'
+user_pref("browser.sessionstore.restore_pinned_tabs_on_demand", true);
+user_pref("browser.sessionstore.restore_on_demand", true);
+user_pref("browser.sessionstore.max_tabs_undo", 2);
+user_pref("browser.sessionstore.interval", 30000);
+user_pref("browser.discovery.enabled", false);
+user_pref("browser.newtabpage.enabled", false);
+user_pref("browser.onboarding.enabled", false);
+user_pref("browser.aboutConfig.showWarning", false);
+user_pref("browser.tabs.remote.autostart", true);
+user_pref("browser.tabs.unloadOnLowMemory", true);
+user_pref("browser.tabs.min_inactive_duration_before_unload", 30000);
+user_pref("browser.memory.low_pri_space_threshold_percent", 70);
+user_pref("browser.memory.high_pri_space_threshold_percent", 60);
+user_pref("browser.memory.low_commit_space_threshold_percent", 80);
+user_pref("browser.memory.high_commit_space_threshold_percent", 70);
+user_pref("browser.tabs.load_delay_limit", 2);
+user_pref("browser.tabs.load_in_background", false);
+user_pref("browser.cache.disk.enable", false);
+user_pref("browser.cache.memory.enable", true);
+user_pref("browser.cache.memory.capacity", 32768);
+user_pref("media.cache_size", 51200);
+user_pref("browser.display.use_document_fonts", 0);
+user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.compositor", true);
+user_pref("layers.acceleration.force-enabled", true);
+user_pref("layers.acceleration.disabled", false);
+user_pref("gfx.canvas.accelerated.cache-size", 512);
+user_pref("gfx.content.opaque-background-color", true);
+user_pref("gfx.color-management.enabled", false);
+user_pref("gfx.font-rendering.cleartype_params.rendering_mode", 2);
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.dns.disablePrefetchHTTPS", true);
+user_pref("network.http.max-connections", 32);
+user_pref("network.http.max-persistent-connections-per-server", 4);
+user_pref("network.http.max-persistent-connections-per-proxy", 2);
+user_pref("network.http.spdy.enabled.v3-1", false);
+FFEOF
+
+    cat > ~/firefox.sh << 'FIREOF'
+#!/data/data/com.termux/files/usr/bin/bash
+export DISPLAY=:0
+source ~/.config/linux-gpu.sh 2>/dev/null || true
+export MOZ_USE_OPENGL=1
+export MOZ_WEBRENDER=1
+export MOZ_ACCELERATED=1
+export LIBGL_ALWAYS_SOFTWARE=0
+export LD_LIBRARY_PATH="/data/data/com.termux/files/usr/lib:${LD_LIBRARY_PATH:-}"
+
+PROFILE_DIR=""
+if [ -f "$HOME/.mozilla/firefox/profiles.ini" ]; then
+    PROFILE_DIR=$(sed -n 's/^Path=//p' "$HOME/.mozilla/firefox/profiles.ini" 2>/dev/null | head -1)
+fi
+if [ -z "$PROFILE_DIR" ]; then
+    PROFILE_DIR=$(find "$HOME/.mozilla/firefox" -maxdepth 2 -type f -name prefs.js 2>/dev/null | head -1 | xargs dirname 2>/dev/null | xargs basename 2>/dev/null)
+fi
+if [ -n "$PROFILE_DIR" ] && [ -f "$HOME/.mozilla/firefox/pnoroot-gpu-prefs.js" ]; then
+    PROFILE_PATH="$HOME/.mozilla/firefox/$PROFILE_DIR"
+    mkdir -p "$PROFILE_PATH"
+    cp -f "$HOME/.mozilla/firefox/pnoroot-gpu-prefs.js" "$PROFILE_PATH/user.js"
+fi
+
+exec firefox "$@"
+FIREOF
+    chmod +x ~/firefox.sh
+    echo -e "  [+] Created ~/firefox.sh (GPU + 1GB RAM tuned)"
+
     if [ "$DE_CHOICE" == "4" ]; then
         echo "export KWIN_COMPOSE=O2ES" >> ~/.config/linux-gpu.sh
         mkdir -p ~/.config/plasma-workspace/env
@@ -1135,13 +1143,14 @@ termux-x11 :0 -ac &
 sleep 3
 export DISPLAY=:0
 
-# Sync proot apps into menu (background, non-blocking)
-[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh > /dev/null 2>&1 &
+    # Sync proot apps into menu (background, non-blocking)
+    [ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh > /dev/null 2>&1 &
 
-# Low-memory guard (no swap on non-rooted Android) — one instance only.
-if [ -f ~/anti-oom.sh ] && ! pgrep -f anti-oom.sh > /dev/null 2>&1; then
-    nohup bash ~/anti-oom.sh > /dev/null 2>&1 &
-fi
+    # RAM Manager: every 30s, drops caches + kills idle non-critical heavy apps.
+    # Never touches foreground processes or the desktop.
+    if [ -f ~/ram-manager.sh ] && ! pgrep -f "ram-manager.sh" > /dev/null 2>&1; then
+        nohup bash ~/ram-manager.sh > /dev/null 2>&1 &
+    fi
 
 echo "----------------------------------------------"
 echo "  [*] Open the Termux-X11 app to see desktop"
@@ -1167,6 +1176,101 @@ echo "Done."
 STOPEOF
     chmod +x ~/stop-linux.sh
     echo -e "  [+] Created ~/stop-linux.sh"
+
+    # ---- power-menu.sh (shutdown / reboot / lockscreen) ----
+    cat > ~/power-menu.sh << 'POWEREOF'
+#!/data/data/com.termux/files/usr/bin/bash
+export DISPLAY=:0
+command -v zenity >/dev/null 2>&1 || { echo "[!] zenity not installed."; exit 1; }
+
+ACTION=$(zenity --list --width=360 --height=260 \
+    --title="Power Menu" \
+    --column="Action" \
+    Lock Screen \
+    Sleep \
+    Reboot desktop \
+    Power off desktop 2>/dev/null) || exit 0
+
+case "$ACTION" in
+    "Lock Screen")
+        [ -f ~/lock-screen.sh ] && bash ~/lock-screen.sh || xset dpms force off 2>/dev/null || true
+        ;;
+    "Sleep")
+        command -v xset >/dev/null 2>&1 && xset dpms force off 2>/dev/null || true
+        ;;
+    "Reboot desktop")
+        zenity --question --width=360 --text="Restart the desktop session?" 2>/dev/null || exit 0
+        [ -f ~/stop-linux.sh ] && bash ~/stop-linux.sh >/dev/null 2>&1 || true
+        bash ~/start-x11.sh >/dev/null 2>&1 &
+        ;;
+    "Power off desktop")
+        zenity --question --width=360 --text="Shut down the desktop session?" 2>/dev/null || exit 0
+        [ -f ~/stop-linux.sh ] && bash ~/stop-linux.sh >/dev/null 2>&1 || true
+        ;;
+esac
+POWEREOF
+    chmod +x ~/power-menu.sh
+    echo -e "  [+] Created ~/power-menu.sh"
+
+    # ---- lock-screen.sh ----
+    cat > ~/lock-screen.sh << 'LOCKEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+export DISPLAY=:0
+command -v xset >/dev/null 2>&1 && xset dpms force off 2>/dev/null || true
+command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null || true
+command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null || true
+LOCKEOF
+    chmod +x ~/lock-screen.sh
+    echo -e "  [+] Created ~/lock-screen.sh"
+
+    # ---- device-info.sh (battery, wifi, gpu, ram, device) ----
+    cat > ~/device-info.sh << 'INFOEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+export DISPLAY=:0
+command -v zenity >/dev/null 2>&1 || { echo "[!] zenity not installed."; exit 1; }
+
+MODEL=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+BRAND=$(getprop ro.product.brand 2>/dev/null || echo "Unknown")
+ANDROID_VER=$(getprop ro.build.version.release 2>/dev/null || echo "Unknown")
+DEVICE=$(getprop ro.product.device 2>/dev/null || echo "Unknown")
+
+BATTERY=$(termux-battery-status 2>/dev/null)
+if [ -n "$BATTERY" ]; then
+    BAT_PCT=$(echo "$BATTERY" | grep -o '"percentage":[0-9]*' | head -1 | cut -d: -f2)
+    BAT_STAT=$(echo "$BATTERY" | grep -o '"status":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"')
+else
+    BAT_PCT="N/A"; BAT_STAT="N/A"
+fi
+
+WIFI_SSID=$(termux-wifi-scaninfo 2>/dev/null | grep -oP '"ssid":"\K[^"]+' | head -1)
+[ -z "$WIFI_SSID" ] && WIFI_SSID="N/A"
+
+TOTAL_RAM=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+AVAIL_RAM=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+[ -n "$TOTAL_RAM" ] && TOTAL_RAM_MB=$(( TOTAL_RAM / 1024 )) || TOTAL_RAM_MB="N/A"
+[ -n "$AVAIL_RAM" ] && AVAIL_RAM_MB=$(( AVAIL_RAM / 1024 )) || AVAIL_RAM_MB="N/A"
+
+GPU=$(getprop ro.hardware.egl 2>/dev/null || echo "N/A")
+if [ "$GPU" = *"adreno"* ] || [ "$GPU" = *"freedreno"* ]; then GPU="Adreno (freedreno/Zink)"; fi
+
+INFO=$(cat <<EOF
+<b>Device Info</b>
+
+<b>Device:</b> $BRAND $MODEL ($DEVICE)
+<b>Android:</b> $ANDROID_VER
+
+<b>Battery:</b> ${BAT_PCT}% ($BAT_STAT)
+<b>WiFi:</b> $WIFI_SSID
+
+<b>GPU:</b> $GPU
+<b>RAM:</b> $AVAIL_RAM_MB MB free / $TOTAL_RAM_MB MB total
+EOF
+)
+
+zenity --info --width=400 --height=320 --title="Device Info" --text="$INFO" 2>/dev/null
+INFOEOF
+    chmod +x ~/device-info.sh
+    echo -e "  [+] Created ~/device-info.sh"
 
     # ~/update.sh: thin wrapper that fetches & runs the latest updater. Keeps
     # the user's config (theme, wallpaper, proot data, storage choice).
@@ -1436,6 +1540,36 @@ step_shortcuts() {
     echo ""
     mkdir -p ~/Desktop
 
+    cat > ~/Desktop/Device-Info.desktop << EOF
+[Desktop Entry]
+Name=Device Info
+Comment=Battery, WiFi, GPU, RAM info
+Exec=bash /data/data/com.termux/files/home/device-info.sh
+Icon=computer
+Type=Application
+Terminal=false
+EOF
+
+    cat > ~/Desktop/Power.desktop << EOF
+[Desktop Entry]
+Name=Power
+Comment=Lock screen, sleep, shutdown
+Exec=bash /data/data/com.termux/files/home/power-menu.sh
+Icon=system-shutdown
+Type=Application
+Terminal=false
+EOF
+
+    cat > ~/Desktop/Lock.desktop << EOF
+[Desktop Entry]
+Name=Lock Screen
+Comment=Lock / turn off screen
+Exec=bash /data/data/com.termux/files/home/lock-screen.sh
+Icon=system-lock-screen
+Type=Application
+Terminal=false
+EOF
+
     cat > ~/Desktop/Chromium.desktop << 'EOF'
 [Desktop Entry]
 Name=Chromium
@@ -1467,28 +1601,8 @@ Icon=utilities-terminal
 Type=Application
 EOF
 
-    cat > ~/Desktop/Install-App.desktop << 'EOF'
-[Desktop Entry]
-Name=Install App (.deb / AppImage)
-Comment=Install a Linux .deb or AppImage into the menu
-Exec=bash /data/data/com.termux/files/home/app-installer.sh
-Icon=system-software-install
-Type=Application
-Terminal=false
-EOF
-
-    cat > ~/Desktop/Click-n-Run.desktop << 'EOF'
-[Desktop Entry]
-Name=Click n run
-Comment=Search and install Termux apps visually
-Exec=bash /data/data/com.termux/files/home/click-n-run.sh
-Icon=system-software-install
-Type=Application
-Terminal=false
-EOF
-
     chmod +x ~/Desktop/*.desktop 2>/dev/null
-    echo -e "  [+] Shortcuts: Chromium, Files, Terminal, Install App, Click n run"
+    echo -e "  [+] Shortcuts: Chromium, Files, Terminal, Device Info, Power, Lock"
 }
 
 # ============== VNC (OPTIONAL — asked at end) ==============
@@ -1597,11 +1711,11 @@ COMPLETE
     echo ""
     echo -e "${CYAN}[*] Installed:${NC}"
     echo "    - Chromium (native) + uBlock Origin, Git, Python 3"
-    echo "    - GPU Acceleration (Turnip/Zink)"
-    echo "    - Visual .deb/AppImage installer (hidden Proot backend)"
-    echo "    - Click n run: visual Termux app store"
-    echo "    - Anti-OOM low-memory guard (auto-starts with the desktop)"
-    echo "    - Modern flat Windows 11-style XFCE Theme (Fluent + Dracula terminal)"
+    echo "    - GPU Acceleration (Turnip/Zink) for Adreno + OpenGL"
+    echo "    - XFCE4 (low RAM compositing disabled)"
+    echo "    - Firefox tuned for 1GB RAM + GPU HW accel"
+    echo "    - RAM Manager (~/ram-manager.sh) auto-starts with desktop"
+    echo "    - Device Info (~/device-info.sh), Power Menu (~/power-menu.sh), Lock Screen"
     if [ "$STORAGE_MODE" = "sd" ]; then
         echo "    - Storage: Linux container on SD card ($SD_CARD_ID)"
     else
@@ -1624,11 +1738,17 @@ COMPLETE
     echo -e "  ${GREEN}Chromium browser (with uBlock Origin):${NC}"
     echo -e "    ${WHITE}bash ~/chromium.sh${NC}"
     echo ""
-    echo -e "  ${GREEN}Install a .deb / AppImage (visual):${NC}"
-    echo -e "    ${WHITE}bash ~/app-installer.sh${NC}"
+    echo -e "  ${GREEN}Device Info (battery, wifi, gpu, ram):${NC}"
+    echo -e "    ${WHITE}bash ~/device-info.sh${NC}"
     echo ""
-    echo -e "  ${GREEN}Click n run (visual Termux app store):${NC}"
-    echo -e "    ${WHITE}bash ~/click-n-run.sh${NC}"
+    echo -e "  ${GREEN}Power Menu (lock, sleep, shutdown):${NC}"
+    echo -e "    ${WHITE}bash ~/power-menu.sh${NC}"
+    echo ""
+    echo -e "  ${GREEN}Lock Screen:${NC}"
+    echo -e "    ${WHITE}bash ~/lock-screen.sh${NC}"
+    echo ""
+    echo -e "  ${GREEN}RAM Manager:${NC}"
+    echo -e "    ${WHITE}bash ~/ram-manager.sh${NC}"
     echo ""
     echo -e "  ${GREEN}Re-sync installed apps → XFCE menu:${NC}"
     echo -e "    ${WHITE}bash ~/proot-menu-sync.sh${NC}"
