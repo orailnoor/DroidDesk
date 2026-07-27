@@ -23,13 +23,13 @@ Everything below has been tested and confirmed working:
 - **Metasploit** -- Pentesting framework, runs fine.
 - **Local AI** -- Offline LLM inference, 5+ tokens/second, no API needed.
 
-If it runs on Ubuntu, it runs here.
+The backend now uses **Alpine Linux** to minimize storage and idle RAM on low-end phones. Packages inside the container are installed with `apk`.
 
 ## How It Works
 
 The Linux environment runs through Termux with direct access to the phone's kernel. No emulation, no translation -- native performance.
 
-The setup script installs a full desktop (XFCE4/LXQt/MATE/KDE) inside Termux using the Termux User Repository (TUR) for GUI apps. For tools not available in TUR (Wireshark, Metasploit, etc.), a Proot container provides a standard Ubuntu/Debian/Kali environment where you install anything with `apt`.
+The setup script uses `proot-distro` to install a minimal Alpine container with XFCE4. Termux-X11 renders the desktop while `virglrenderer-android` exposes GPU acceleration through VirGL (`GALLIUM_DRIVER=virpipe`), keeping the session lean enough for entry-level devices.
 
 The automatic menu sync scans what you install inside Proot and adds it directly to your desktop app menu. No need to enter the container every time.
 
@@ -86,11 +86,11 @@ The script will:
 1. Update Termux packages
 2. Add X11 and TUR repositories
 3. Install your chosen desktop environment (XFCE4/LXQt/MATE/KDE)
-4. Set up GPU acceleration (Turnip for Adreno, Zink fallback for others)
+4. Set up VirGL GPU acceleration with `virglrenderer-android`
 5. Install Git, Python, and core tools
-6. Set up a Proot Linux backend (Ubuntu) for the visual `.deb` / AppImage installer
+6. Set up an Alpine Linux backend with XFCE4, D-Bus, Mesa, and Papirus icons
 7. Create the App Bridge for automatic menu syncing
-8. Apply a modern flat Windows 11-style dark theme (Fluent + Fluent icons), with the compositor off to keep RAM/CPU usage low
+8. Prepare the Fluent window theme and apply Papirus-Dark icons, with the compositor off to keep RAM/CPU usage low
 9. Optionally set up VNC for remote access
 
 ### Step 4: Start the Desktop
@@ -106,7 +106,7 @@ Then open the Termux-X11 app on your phone. Your desktop is ready.
 ### Step 5: Install Desktop Apps
 
 Use `pkg search <name>` or `pkg install <name>` in Termux to install native apps.
-For Linux GUI apps in Proot, open a terminal and run `proot-distro login ubuntu -- apt install <pkg>`.
+For Linux GUI apps in Alpine, run `proot-distro login alpine -- apk add <pkg>`. The desktop launcher automatically starts VirGL, Termux-X11, and then `dbus-launch --exit-with-session startxfce4` inside Alpine.
 
 ### Memory & stability
 
@@ -116,7 +116,7 @@ auto-started by `start-x11.sh`) watches free RAM and, when it gets low, drops
 caches and silences idle non-critical background processes — without killing
 foreground apps, the browser, or the desktop session.
 
-If the Proot backend ever reports `container 'ubuntu' is not installed` (common
+If the Proot backend ever reports `container 'alpine' is not installed` (common
 when it lives on an SD card that got unmounted), run `bash ~/fix-proot.sh` — it
 prints diagnostics, repairs a dangling SD link, and reinstalls the rootfs if
 needed.
