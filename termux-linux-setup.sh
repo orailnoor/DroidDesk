@@ -602,6 +602,7 @@ fi
 
 echo "[*] Bootstrapping Alpine desktop (XFCE + Firefox + sensors + su)..."
 proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc '
+    set -e
     # 1) Enable the community repo — XFCE, Firefox and Papirus live there.
     #    Without this apk finds almost nothing and the desktop has no apps.
     sed -i "s|^#\(.*/community\)$|\1|" /etc/apk/repositories 2>/dev/null || true
@@ -612,14 +613,18 @@ proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc '
     # 2) Full desktop stack. font-dejavu is REQUIRED: without fonts XFCE
     #    renders a black/blank screen. desktop-file-utils + shared-mime-info
     #    make app menu entries actually appear.
+    # Keep the boot-critical set separate: one unavailable optional package
+    # must never prevent XFCE and D-Bus from being installed.
     apk add --no-cache \
-        bash dbus dbus-x11 sudo shadow busybox-suid \
-        xfce4 xfce4-session xfce4-terminal xfce4-appfinder thunar \
-        xfce4-whiskermenu-plugin desktop-file-utils shared-mime-info \
-        mesa-dri-gallium mesa-egl mesa-gl mesa-utils \
-        font-dejavu adwaita-icon-theme papirus-icon-theme \
-        firefox-esr \
-        curl wget git htop nano
+        bash dbus dbus-x11 shadow \
+        xfce4 xfce4-session xfce4-terminal thunar \
+        desktop-file-utils shared-mime-info \
+        mesa-dri-gallium mesa-egl mesa-gl \
+        font-dejavu adwaita-icon-theme
+    apk add --no-cache sudo busybox-suid xfce4-appfinder \
+        xfce4-whiskermenu-plugin mesa-utils papirus-icon-theme \
+        firefox-esr curl wget git htop nano || \
+        echo "[!] Some optional apps were unavailable; desktop core is intact."
 
     # 3) D-Bus needs a machine id or dbus-launch dies silently (black screen).
     [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id
@@ -670,7 +675,10 @@ SENSOREOF
   </property>
 </channel>
 ALPINE_XFCE
-'
+' || {
+    echo "[!] Alpine desktop bootstrap failed. Review the apk error above."
+    exit 1
+}
 echo "[+] Alpine desktop ready (XFCE + Firefox ESR + Papirus + su/sudo + sensors)."
 BOOTEOF
     chmod +x ~/alpine-bootstrap.sh
@@ -678,8 +686,11 @@ BOOTEOF
 
     if [ "$PROOT_READY" = "1" ]; then
         echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
-        bash ~/alpine-bootstrap.sh > /dev/null 2>&1 || true
-        echo -e "  [+] ${PROOT_LABEL} ready (XFCE + Firefox ESR + Papirus + sensors + su)."
+        if bash ~/alpine-bootstrap.sh; then
+            echo -e "  [+] ${PROOT_LABEL} ready (XFCE + Firefox ESR + Papirus + sensors + su)."
+        else
+            echo -e "  [!] Alpine exists, but its desktop setup failed. Retry with: bash ~/alpine-bootstrap.sh"
+        fi
     fi
 
     # ---- sensor-bridge.sh (Termux side) ----
@@ -766,7 +777,9 @@ echo " Type 'exit' to leave proot."
 echo ""
 RCEOF
 
-proot-distro login "\$PROOT_DISTRO" \$BINDS --user root -- bash --rcfile "\$_RC"
+# Options precede the distro for compatibility with every proot-distro release.
+# Alpine sessions are root by default; no --user option is needed.
+proot-distro login \$BINDS "\$PROOT_DISTRO" -- /bin/bash --rcfile "\$_RC"
 rm -f "\$_RC"
 PROOTEOF
     chmod +x ~/start-proot.sh
@@ -1225,11 +1238,16 @@ ensure_alpine() {
             PROOT_NO_SECCOMP=1 proot-distro install alpine || exit 1
         fi
     fi
-    # Make sure startxfce4 actually exists inside the container (repairs
-    # half-installed rootfs where the GUI packages never got installed).
-    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4' >/dev/null 2>&1; then
-        echo "[*] Alpine found but XFCE missing — bootstrapping desktop..."
+    # proot-distro options must precede the distro name. Placing --shared-tmp
+    # or --user after "alpine" makes some proot-distro versions treat them as
+    # the guest command, so XFCE never starts.
+    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4 && command -v dbus-launch' >/dev/null 2>&1; then
+        echo "[*] Alpine found but the desktop is incomplete — repairing it..."
         [ -f ~/alpine-bootstrap.sh ] && bash ~/alpine-bootstrap.sh
+    fi
+    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4 && command -v dbus-launch' >/dev/null 2>&1; then
+        echo "[!] XFCE or D-Bus could not be installed. Run: bash ~/alpine-bootstrap.sh"
+        return 1
     fi
 }
 
@@ -1247,25 +1265,47 @@ start_desktop() {
     pulseaudio --start --exit-idle-time=-1
     export PULSE_SERVER=127.0.0.1
 
-    echo "[*] Starting VirGL renderer (GPU)..."
-    virgl_test_server_android &
-    VIRGL_PID=\$!
+    VIRGL_PID=""
+    if command -v virgl_test_server_android >/dev/null 2>&1; then
+        echo "[*] Starting VirGL renderer (GPU)..."
+        virgl_test_server_android >/tmp/droiddesk-virgl.log 2>&1 &
+        VIRGL_PID=\$!
+    else
+        echo "[!] VirGL is unavailable; using Mesa software rendering."
+    fi
 
-    # -ac disables X access control: REQUIRED so the Alpine container can
-    # connect to the display. Without it the GUI never shows up.
+    # -ac allows the Alpine client. Launching the Android activity removes the
+    # need to manually reopen Termux-X11 after Android has killed its UI.
     echo "[*] Starting Termux-X11 on :0..."
-    termux-x11 :0 -ac &
+    rm -f "\${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X0-lock" 2>/dev/null
+    termux-x11 :0 -ac >/tmp/droiddesk-x11.log 2>&1 &
     X11_PID=\$!
+    command -v am >/dev/null 2>&1 && \
+        am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1 || true
 
-    # Wait for the X socket instead of a blind sleep (slow devices need more).
+    # Wait for the X socket instead of racing XFCE on slow phones.
     TERMUX_TMP="\${TMPDIR:-/data/data/com.termux/files/usr/tmp}"
-    for i in \$(seq 1 20); do
-        [ -e "\$TERMUX_TMP/.X11-unix/X0" ] && break
+    X_SOCKET="\$TERMUX_TMP/.X11-unix/X0"
+    for i in \$(seq 1 40); do
+        [ -S "\$X_SOCKET" ] && break
+        kill -0 "\$X11_PID" 2>/dev/null || break
         sleep 0.5
     done
+    if [ ! -S "\$X_SOCKET" ]; then
+        echo "[!] Termux-X11 did not create \$X_SOCKET."
+        echo "[!] Install/open the Termux-X11 Android app, then retry."
+        tail -n 10 /tmp/droiddesk-x11.log 2>/dev/null
+        return 1
+    fi
 
     export DISPLAY=:0
-    export GALLIUM_DRIVER=virpipe
+    if [ -n "\$VIRGL_PID" ] && kill -0 "\$VIRGL_PID" 2>/dev/null; then
+        export GALLIUM_DRIVER=virpipe
+        unset LIBGL_ALWAYS_SOFTWARE
+    else
+        export GALLIUM_DRIVER=llvmpipe
+        export LIBGL_ALWAYS_SOFTWARE=1
+    fi
     export MESA_GL_VERSION_OVERRIDE=4.0
 
     # Android sensor bridge (accelerometer, gyro, light, battery...).
@@ -1273,21 +1313,24 @@ start_desktop() {
         nohup bash ~/sensor-bridge.sh >/dev/null 2>&1 &
     fi
 
-    trap 'kill \$VIRGL_PID \$X11_PID 2>/dev/null || true; pkill -f "sensor-bridge.sh" 2>/dev/null || true' EXIT INT TERM
+    trap '[ -n "\$VIRGL_PID" ] && kill "\$VIRGL_PID" 2>/dev/null; kill "\$X11_PID" 2>/dev/null; pkill -f "sensor-bridge.sh" 2>/dev/null || true' EXIT INT TERM
 
     if [ -f ~/ram-manager.sh ] && ! pgrep -f "ram-manager.sh" >/dev/null 2>&1; then
         nohup bash ~/ram-manager.sh >/dev/null 2>&1 &
     fi
 
     echo "----------------------------------------------"
-    echo "  [*] Open the Termux-X11 app to see desktop"
+    echo "  [*] Starting Alpine XFCE now"
     echo "  [*] Root: session runs as root ('su' works)"
     echo "  [*] Sensors: run 'termux-sensor' inside Alpine"
     echo "----------------------------------------------"
-    # --shared-tmp shares Termux /tmp (X11 + VirGL sockets + sensor bridge)
-    # with Alpine. Session runs as root, so 'su' and 'sudo' both work.
-    PROOT_NO_SECCOMP=1 proot-distro login alpine --shared-tmp --user root -- \
-        /bin/sh -lc 'export DISPLAY=:0 GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp PULSE_SERVER=127.0.0.1; dbus-launch --exit-with-session startxfce4'
+
+    # IMPORTANT: login options go before the distro. Alpine already enters as
+    # root by default, so --user root is unnecessary and broke older releases.
+    # Pass the selected renderer into the guest instead of forcing virpipe when
+    # VirGL failed to start.
+    PROOT_NO_SECCOMP=1 proot-distro login --shared-tmp alpine -- \
+        /bin/sh -lc "export DISPLAY=:0 GALLIUM_DRIVER='\$GALLIUM_DRIVER' MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp PULSE_SERVER=127.0.0.1; export NO_AT_BRIDGE=1; dbus-launch --exit-with-session startxfce4" 2>&1 | tee /tmp/droiddesk-xfce.log
 }
 
 start_desktop
@@ -1901,7 +1944,7 @@ COMPLETE
     echo ""
     echo -e "${CYAN}  👤 Your username : ${WHITE}${SETUP_USERNAME}${NC}"
     echo ""
-    echo -e "${YELLOW}  ★━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━★${NC}"
+    echo -e "${YELLOW}  ★━━━━━━━━━━━━━━━━━━━━━━��━━━━━━━━━━━━━━━━━━━━━━━━━━★${NC}"
     echo -e "${WHITE}     If you found this helpful, please subscribe to:${NC}"
     echo -e "${RED}           ▶  orailnoor  on YouTube  ◀${NC}"
     echo -e "${YELLOW}  ★━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━★${NC}"
