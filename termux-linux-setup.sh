@@ -294,6 +294,9 @@ setup_storage() {
     PROOT_SD_BASE="${sd_termux_priv}/p-noroot-linux"
 
     # Verify we can actually write there before committing.
+    # Also check that the SD card is not FAT/exFAT (which can't hold
+    # Linux rootfs permissions) by trying to create a test file.
+    local sd_test_file="${PROOT_SD_BASE}/.write-test"
     if ! mkdir -p "$PROOT_SD_BASE/installed-rootfs" 2>/dev/null; then
         echo -e "  ${YELLOW}[!] Cannot write to ${PROOT_SD_BASE}.${NC}"
         echo -e "  ${YELLOW}    Check the SD ID is correct, the card is inserted, and that${NC}"
@@ -304,6 +307,17 @@ setup_storage() {
         PROOT_SD_BASE=""
         return 0
     fi
+    if ! touch "$sd_test_file" 2>/dev/null; then
+        echo -e "  ${YELLOW}[!] SD card is not writable (filesystem may be FAT/exFAT).${NC}"
+        echo -e "  ${YELLOW}    Linux rootfs requires a POSIX-compliant filesystem (ext4/fsck).${NC}"
+        echo -e "  ${YELLOW}    Falling back to internal storage.${NC}"
+        rm -f "$sd_test_file" 2>/dev/null || true
+        STORAGE_MODE="internal"
+        SD_CARD_ID=""
+        PROOT_SD_BASE=""
+        return 0
+    fi
+    rm -f "$sd_test_file"
 
     # Point proot-distro's installed-rootfs dir at the SD card via a symlink.
     # proot-distro already logs in with --link2symlink, so it tolerates the
@@ -315,6 +329,16 @@ setup_storage() {
         rm -rf "$pd_rootfs" 2>/dev/null || true
     fi
     ln -sfn "$PROOT_SD_BASE/installed-rootfs" "$pd_rootfs"
+
+    # Also symlink the proot-distro var directory so any cached data
+    # (downloads, logs) also lives on the SD card.
+    local pd_var="${TERMUX_PREFIX}/var/lib/proot-distro"
+    if [ -d "$pd_var" ] && [ ! -L "$pd_var" ]; then
+        local pd_var_backup="${pd_var}.bak"
+        mv "$pd_var" "$pd_var_backup" 2>/dev/null || true
+    fi
+    mkdir -p "${PROOT_SD_BASE}/var-lib-proot-distro"
+    ln -sfn "${PROOT_SD_BASE}/var-lib-proot-distro" "$pd_var" 2>/dev/null || true
 
     STORAGE_MODE="sd"
     echo -e "  ${GREEN}[+] Linux container will be stored in Termux's private folder${NC}"
@@ -422,58 +446,13 @@ step_apps() {
     install_pkg "htop" "htop"
     install_pkg "xdotool"
 
-    # Native Firefox (runs in Termux, no proot)
-    install_pkg "firefox" "Firefox"
+    # Chromium (native, runs in Termux without proot).
+    # uBlock Origin is force-installed through the managed policy below.
+    install_pkg "chromium" "Chromium"
     install_pkg "xfce4-goodies" "XFCE4 Goodies (Basic apps)"
     install_pkg "libnotify" "libnotify (desktop notifications)"
     install_pkg "procps" "procps (ps/pkill/kill for RAM mgr)"
     install_pkg "zenity" "Zenity (power/info dialogs)"
-
-    # Configure Firefox for 1GB RAM + Adreno GPU + Zink/VA-API offload
-    FIREFOX_DIR="${TERMUX_PREFIX}/lib/firefox"
-    FIREFOX_PREFS="${HOME}/.mozilla/firefox/*.default-release/prefs.js"
-    mkdir -p "$(dirname "$FIREFOX_PREFS")" 2>/dev/null || true
-
-    cat > ~/.mozilla/firefox/pnoroot-gpu-prefs.js << 'FFEOF'
-// P-noroot linux: Firefox tuned for 1GB RAM + Adreno GPU + Zink/VA-API
-user_pref("browser.sessionstore.restore_pinned_tabs_on_demand", true);
-user_pref("browser.sessionstore.restore_on_demand", true);
-user_pref("browser.sessionstore.max_tabs_undo", 2);
-user_pref("browser.sessionstore.interval", 30000);
-user_pref("browser.discovery.enabled", false);
-user_pref("browser.newtabpage.enabled", false);
-user_pref("browser.onboarding.enabled", false);
-user_pref("browser.aboutConfig.showWarning", false);
-user_pref("browser.tabs.remote.autostart", true);
-user_pref("browser.tabs.unloadOnLowMemory", true);
-user_pref("browser.tabs.min_inactive_duration_before_unload", 30000);
-user_pref("browser.memory.low_pri_space_threshold_percent", 70);
-user_pref("browser.memory.high_pri_space_threshold_percent", 60);
-user_pref("browser.memory.low_commit_space_threshold_percent", 80);
-user_pref("browser.memory.high_commit_space_threshold_percent", 70);
-user_pref("browser.tabs.load_delay_limit", 2);
-user_pref("browser.tabs.load_in_background", false);
-user_pref("browser.cache.disk.enable", false);
-user_pref("browser.cache.memory.enable", true);
-user_pref("browser.cache.memory.capacity", 32768);
-user_pref("media.cache_size", 51200);
-user_pref("browser.display.use_document_fonts", 0);
-user_pref("gfx.webrender.all", true);
-user_pref("gfx.webrender.compositor", true);
-user_pref("layers.acceleration.force-enabled", true);
-user_pref("layers.acceleration.disabled", false);
-user_pref("gfx.canvas.accelerated.cache-size", 512);
-user_pref("gfx.content.opaque-background-color", true);
-user_pref("gfx.color-management.enabled", false);
-user_pref("gfx.font-rendering.cleartype_params.rendering_mode", 2);
-user_pref("network.dns.disablePrefetch", true);
-user_pref("network.dns.disablePrefetchHTTPS", true);
-user_pref("network.http.max-connections", 32);
-user_pref("network.http.max-persistent-connections-per-server", 4);
-user_pref("network.http.max-persistent-connections-per-proxy", 2);
-user_pref("network.http.spdy.enabled.v3-1", false);
-FFEOF
-    echo -e "  [+] Firefox configured: GPU HW accel + 1GB RAM tuned"
 
     # Force-install uBlock Origin (Lite, MV3 — required by modern Chromium)
     # via Chromium's managed policy so it ships preinstalled and enabled.
@@ -603,6 +582,23 @@ fi
 echo "[*] Bootstrapping Alpine desktop (XFCE + Firefox + sensors + su)..."
 proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc '
     set -e
+    # 0) Disable OpenRC services that conflict with proot.
+    #    Networking, hostname, and bootmisc try to manage system state
+    #    that proot cannot provide, causing "container is busy" or
+    #    "init: can't open /dev/console" on every login.
+    rc-update del networking boot 2>/dev/null || true
+    rc-update del hostname boot 2>/dev/null || true
+    rc-update del bootmisc boot 2>/dev/null || true
+    rc-update del sysctl boot 2>/dev/null || true
+    rc-update del swap boot 2>/dev/null || true
+    rc-update del hostname sysinit 2>/dev/null || true
+    rc-update del netmisc sysinit 2>/dev/null || true
+    # Prevent OpenRC from auto-starting anything on first boot inside proot.
+    rm -f /etc/runlevels/boot/* /etc/runlevels/sysinit/* 2>/dev/null || true
+    # Keep only essential services.
+    rc-update add dbus sysinit 2>/dev/null || true
+    rc-update add elogind sysinit 2>/dev/null || true
+
     # 1) Enable the community repo — XFCE, Firefox and Papirus live there.
     #    Without this apk finds almost nothing and the desktop has no apps.
     sed -i "s|^#\(.*/community\)$|\1|" /etc/apk/repositories 2>/dev/null || true
@@ -620,10 +616,18 @@ proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc '
         xfce4 xfce4-session xfce4-terminal thunar \
         desktop-file-utils shared-mime-info \
         mesa-dri-gallium mesa-egl mesa-gl \
-        font-dejavu adwaita-icon-theme
+        font-dejavu adwaita-icon-theme \
+        firefox-esr chromium \
+        gvfs gvfs-mtp \
+        ttf-freefont \
+        alsa-utils \
+        dbus-x11 \
+        xdg-user-dirs \
+        mime-support \
+        hicolor-icon-theme
     apk add --no-cache sudo busybox-suid xfce4-appfinder \
         xfce4-whiskermenu-plugin mesa-utils papirus-icon-theme \
-        firefox-esr curl wget git htop nano || \
+        firefox-esr chromium curl wget git htop nano || \
         echo "[!] Some optional apps were unavailable; desktop core is intact."
 
     # 3) D-Bus needs a machine id or dbus-launch dies silently (black screen).
@@ -749,6 +753,12 @@ echo "  [*] Starting \$PROOT_LABEL"
 echo "============================================="
 echo ""
 
+# Clean up stale state from previous sessions so Alpine is never "busy".
+rm -f "\$TERMUX_TMP/.X0-lock" 2>/dev/null || true
+rm -f "\$TERMUX_TMP/.X11-unix/X0" 2>/dev/null || true
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
+pkill -9 -f "virgl_test_server_android" 2>/dev/null || true
+
 BINDS=""
 [ -d "\$TERMUX_TMP/.X11-unix" ] && BINDS="\$BINDS --bind \$TERMUX_TMP/.X11-unix:/tmp/.X11-unix"
 [ -d "/dev/dri" ]               && BINDS="\$BINDS --bind /dev/dri:/dev/dri"
@@ -756,6 +766,10 @@ BINDS=""
 [ -d "${TERMUX_VK_ICD}" ]       && BINDS="\$BINDS --bind ${TERMUX_VK_ICD}:/usr/share/vulkan/icd.d.termux"
 [ -f "${TERMUX_LIB}/libvulkan.so" ] && \
     BINDS="\$BINDS --bind ${TERMUX_LIB}/libvulkan.so:/usr/lib/aarch64-linux-gnu/libvulkan_termux.so"
+
+# Kill any stale proot-distro login processes before starting a new one.
+pkill -9 -f "proot-distro login" 2>/dev/null || true
+sleep 0.5
 
 _RC=\$(mktemp /data/data/com.termux/files/usr/tmp/proot_rc.XXXX)
 cat > "\$_RC" << 'RCEOF'
@@ -785,17 +799,41 @@ PROOTEOF
     chmod +x ~/start-proot.sh
     echo -e "  [+] Created ~/start-proot.sh"
 
-    # ---- chromium.sh (native browser launcher) ----
-    # Chromium runs natively in Termux (no proot). uBlock Origin is force-
-    # installed through the managed policy written in step_apps.
+    # ---- chromium.sh (launches Chromium inside proot) ----
+    # Chromium runs inside the Alpine proot container with GPU support.
+    # uBlock Origin is force-installed through the managed policy
+    # written in step_apps (applied inside Alpine on first bootstrap).
     cat > ~/chromium.sh << 'CHROMEEOF'
 #!/data/data/com.termux/files/usr/bin/bash
+# Launches Chromium inside the Alpine proot container.
 export DISPLAY=:0
-# --no-sandbox: Android has no unprivileged user namespaces for the sandbox.
-exec chromium --no-sandbox --ozone-platform-hint=auto "$@"
+export PROOT_NO_SECCOMP=1
+
+TERMUX_TMP="${TMPDIR:-/data/data/com.termux/files/usr/tmp}"
+BINDS=""
+[ -d "$TERMUX_TMP/.X11-unix" ] && BINDS="$BINDS --bind $TERMUX_TMP/.X11-unix:/tmp/.X11-unix"
+[ -d "/dev/dri" ]               && BINDS="$BINDS --bind /dev/dri:/dev/dri"
+[ -e "/dev/kgsl-3d0" ]          && BINDS="$BINDS --bind /dev/kgsl-3d0:/dev/kgsl-3d0"
+
+PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
+PROOT_DISTRO="alpine"
+
+GALLIUM_DRIVER="${GALLIUM_DRIVER:-virpipe}"
+
+$PROOT_BIN login $BINDS "$PROOT_DISTRO" -- /bin/sh -lc "
+export DISPLAY=:0
+export GALLIUM_DRIVER='$GALLIUM_DRIVER'
+export MESA_GL_VERSION_OVERRIDE=4.0
+export MESA_GLES_VERSION_OVERRIDE=3.2
+export MESA_NO_ERROR=1
+export XDG_RUNTIME_DIR=/tmp
+export NO_AT_BRIDGE=1
+export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
+exec chromium --no-sandbox --ozone-platform-hint=auto \"\$@\"
+" -- "$@"
 CHROMEEOF
     chmod +x ~/chromium.sh
-    echo -e "  [+] Created ~/chromium.sh (native Chromium launcher)"
+    echo -e "  [+] Created ~/chromium.sh (Chromium inside proot)"
 
     # ---- ram-manager.sh (lightweight RAM cleaner for low-memory devices) ----
     # Frees background/cache/idle processes WITHOUT killing foreground apps,
@@ -910,7 +948,63 @@ FIXEOF
     chmod +x ~/fix-proot.sh
     echo -e "  [+] Created ~/fix-proot.sh (diagnose & repair backend)"
 
-    # ---- proot-menu-sync.sh (v5 — embedded) ----
+    # ---- stop-proot.sh ----
+    # Gracefully kills every proot-related process, cleans up stale
+    # X11 locks, PulseAudio, and the sensor bridge so the next
+    # start-x11.sh launch is never "alpine is busy".
+    cat > ~/stop-proot.sh << 'STOPEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+echo "[*] Stopping all P-noroot sessions..."
+
+# Kill the desktop session inside proot.
+PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc '
+    pkill -9 xfce4-session 2>/dev/null || true
+    pkill -9 startxfce4 2>/dev/null || true
+    pkill -9 dbus-launch 2>/dev/null || true
+    pkill -9 pulseaudio 2>/dev/null || true
+    pkill -9 Xwayland 2>/dev/null || true
+    pkill -9 xfce4-panel 2>/dev/null || true
+    pkill -9 xfdesktop 2>/dev/null || true
+    pkill -9 xfwm4 2>/dev/null || true
+    pkill -9 thunar 2>/dev/null || true
+    pkill -9 xfce4-terminal 2>/dev/null || true
+' 2>/dev/null || true
+
+# Kill native Termux-side processes.
+pkill -9 -f "termux.x11" 2>/dev/null || true
+pkill -9 -f "virgl_test_server_android" 2>/dev/null || true
+pkill -9 -f "sensor-bridge.sh" 2>/dev/null || true
+pkill -9 -f "ram-manager.sh" 2>/dev/null || true
+pkill -9 -f "Xvnc" 2>/dev/null || true
+vncserver -kill :1 2>/dev/null || true
+
+# Clean up PulseAudio.
+pulseaudio --kill 2>/dev/null || true
+
+# Remove stale X11 lock files.
+rm -f /tmp/.X0-lock /tmp/.X1-lock /tmp/.X11-unix/X0 /tmp/.X11-unix/X1 2>/dev/null || true
+rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X0-lock" 2>/dev/null || true
+rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X11-unix/X0" 2>/dev/null || true
+
+# Clean up stale proot PID/lock files inside the rootfs.
+PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
+ROOTFS="$PREFIX_DIR/var/lib/proot-distro/installed-rootfs/alpine"
+if [ -d "$ROOTFS" ]; then
+    rm -f "$ROOTFS/run/proot.pid" 2>/dev/null || true
+    rm -f "$ROOTFS/var/run/proot.pid" 2>/dev/null || true
+    rm -f "$ROOTFS/tmp/.X11-unix/X0" 2>/dev/null || true
+fi
+
+# Kill any remaining proot-distro login processes.
+pkill -9 -f "proot-distro login" 2>/dev/null || true
+pkill -9 -f "proot.*alpine" 2>/dev/null || true
+
+echo "[+] All sessions stopped. Alpine is no longer busy."
+STOPEOF
+    chmod +x ~/stop-proot.sh
+    echo -e "  [+] Created ~/stop-proot.sh (clean session termination)"
+
+    # ---- proot-menu-sync.sh (v5 -- embedded) ----
     cat > ~/proot-menu-sync.sh << 'SYNCEOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
@@ -1117,74 +1211,41 @@ export XDG_DATA_DIRS=/data/data/com.termux/files/usr/share:\${XDG_DATA_DIRS}
 export XDG_CONFIG_DIRS=/data/data/com.termux/files/usr/etc/xdg:\${XDG_CONFIG_DIRS}
 EOF
 
-    # Firefox RAM/GPU wrapper: launches Firefox with forced GPU + low-memory prefs
-    mkdir -p ~/.mozilla/firefox
-    cat > ~/.mozilla/firefox/pnoroot-gpu-prefs.js << 'FFEOF'
-user_pref("browser.sessionstore.restore_pinned_tabs_on_demand", true);
-user_pref("browser.sessionstore.restore_on_demand", true);
-user_pref("browser.sessionstore.max_tabs_undo", 2);
-user_pref("browser.sessionstore.interval", 30000);
-user_pref("browser.discovery.enabled", false);
-user_pref("browser.newtabpage.enabled", false);
-user_pref("browser.onboarding.enabled", false);
-user_pref("browser.aboutConfig.showWarning", false);
-user_pref("browser.tabs.remote.autostart", true);
-user_pref("browser.tabs.unloadOnLowMemory", true);
-user_pref("browser.tabs.min_inactive_duration_before_unload", 30000);
-user_pref("browser.memory.low_pri_space_threshold_percent", 70);
-user_pref("browser.memory.high_pri_space_threshold_percent", 60);
-user_pref("browser.memory.low_commit_space_threshold_percent", 80);
-user_pref("browser.memory.high_commit_space_threshold_percent", 70);
-user_pref("browser.tabs.load_delay_limit", 2);
-user_pref("browser.tabs.load_in_background", false);
-user_pref("browser.cache.disk.enable", false);
-user_pref("browser.cache.memory.enable", true);
-user_pref("browser.cache.memory.capacity", 32768);
-user_pref("media.cache_size", 51200);
-user_pref("browser.display.use_document_fonts", 0);
-user_pref("gfx.webrender.all", true);
-user_pref("gfx.webrender.compositor", true);
-user_pref("layers.acceleration.force-enabled", true);
-user_pref("layers.acceleration.disabled", false);
-user_pref("gfx.canvas.accelerated.cache-size", 512);
-user_pref("gfx.content.opaque-background-color", true);
-user_pref("gfx.color-management.enabled", false);
-user_pref("gfx.font-rendering.cleartype_params.rendering_mode", 2);
-user_pref("network.dns.disablePrefetch", true);
-user_pref("network.dns.disablePrefetchHTTPS", true);
-user_pref("network.http.max-connections", 32);
-user_pref("network.http.max-persistent-connections-per-server", 4);
-user_pref("network.http.max-persistent-connections-per-proxy", 2);
-user_pref("network.http.spdy.enabled.v3-1", false);
-FFEOF
-
     cat > ~/firefox.sh << 'FIREOF'
 #!/data/data/com.termux/files/usr/bin/bash
+# Launches Firefox ESR inside the Alpine proot container.
 export DISPLAY=:0
-source ~/.config/linux-gpu.sh 2>/dev/null || true
+export PROOT_NO_SECCOMP=1
+
+TERMUX_TMP="${TMPDIR:-/data/data/com.termux/files/usr/tmp}"
+BINDS=""
+[ -d "$TERMUX_TMP/.X11-unix" ] && BINDS="$BINDS --bind $TERMUX_TMP/.X11-unix:/tmp/.X11-unix"
+[ -d "/dev/dri" ]               && BINDS="$BINDS --bind /dev/dri:/dev/dri"
+[ -e "/dev/kgsl-3d0" ]          && BINDS="$BINDS --bind /dev/kgsl-3d0:/dev/kgsl-3d0"
+
+PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
+PROOT_DISTRO="alpine"
+
+GALLIUM_DRIVER="${GALLIUM_DRIVER:-virpipe}"
+
+$PROOT_BIN login $BINDS "$PROOT_DISTRO" -- /bin/sh -lc "
+export DISPLAY=:0
+export GALLIUM_DRIVER='$GALLIUM_DRIVER'
+export MESA_GL_VERSION_OVERRIDE=4.0
+export MESA_GLES_VERSION_OVERRIDE=3.2
+export MESA_NO_ERROR=1
+export XDG_RUNTIME_DIR=/tmp
 export MOZ_USE_OPENGL=1
 export MOZ_WEBRENDER=1
 export MOZ_ACCELERATED=1
 export LIBGL_ALWAYS_SOFTWARE=0
-export LD_LIBRARY_PATH="/data/data/com.termux/files/usr/lib:${LD_LIBRARY_PATH:-}"
-
-PROFILE_DIR=""
-if [ -f "$HOME/.mozilla/firefox/profiles.ini" ]; then
-    PROFILE_DIR=$(sed -n 's/^Path=//p' "$HOME/.mozilla/firefox/profiles.ini" 2>/dev/null | head -1)
-fi
-if [ -z "$PROFILE_DIR" ]; then
-    PROFILE_DIR=$(find "$HOME/.mozilla/firefox" -maxdepth 2 -type f -name prefs.js 2>/dev/null | head -1 | xargs dirname 2>/dev/null | xargs basename 2>/dev/null)
-fi
-if [ -n "$PROFILE_DIR" ] && [ -f "$HOME/.mozilla/firefox/pnoroot-gpu-prefs.js" ]; then
-    PROFILE_PATH="$HOME/.mozilla/firefox/$PROFILE_DIR"
-    mkdir -p "$PROFILE_PATH"
-    cp -f "$HOME/.mozilla/firefox/pnoroot-gpu-prefs.js" "$PROFILE_PATH/user.js"
-fi
-
-exec firefox "$@"
+export NO_AT_BRIDGE=1
+export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
+exec firefox-esr \"\$@\"
+" -- "$@"
 FIREOF
-    chmod +x ~/firefox.sh
-    echo -e "  [+] Created ~/firefox.sh (GPU + 1GB RAM tuned)"
+chmod +x ~/firefox.sh
+echo -e "  [+] Created ~/firefox.sh (launches Firefox ESR inside proot)"
 
     if [ "$DE_CHOICE" == "4" ]; then
         echo "export KWIN_COMPOSE=O2ES" >> ~/.config/linux-gpu.sh
@@ -1227,6 +1288,17 @@ export HOSTNAME="android-linux"
 export HOST="android-linux"
 
 ensure_alpine() {
+    # Clean up any stale proot processes from a previous crashed session.
+    # This is the primary fix for "container alpine is busy".
+    pkill -9 -f "proot-distro login" 2>/dev/null || true
+    pkill -9 -f "proot.*alpine" 2>/dev/null || true
+    pkill -9 -f "virgl_test_server_android" 2>/dev/null || true
+    sleep 0.5
+    # Remove stale X11 locks that can prevent a new session.
+    rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X0-lock" 2>/dev/null || true
+    rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X11-unix/X0" 2>/dev/null || true
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
+
     # Auto-install Alpine if the proot container is missing (first run,
     # wiped storage, failed setup, etc.) so the desktop always comes up.
     local rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/alpine"
@@ -1238,21 +1310,47 @@ ensure_alpine() {
             PROOT_NO_SECCOMP=1 proot-distro install alpine || exit 1
         fi
     fi
-    # proot-distro options must precede the distro name. Placing --shared-tmp
-    # or --user after "alpine" makes some proot-distro versions treat them as
-    # the guest command, so XFCE never starts.
-    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4 && command -v dbus-launch' >/dev/null 2>&1; then
-        echo "[*] Alpine found but the desktop is incomplete — repairing it..."
-        [ -f ~/alpine-bootstrap.sh ] && bash ~/alpine-bootstrap.sh
+    # Verify Alpine is actually usable — on SD cards the rootfs symlink
+    # can be dangling if the card was removed. Auto-repair if needed.
+    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4' >/dev/null 2>&1; then
+        echo "[!] Alpine login failed — attempting repair..."
+        if [ -f ~/fix-proot.sh ]; then bash ~/fix-proot.sh; fi
+        if [ -f ~/alpine-bootstrap.sh ]; then bash ~/alpine-bootstrap.sh; fi
     fi
-    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4 && command -v dbus-launch' >/dev/null 2>&1; then
-        echo "[!] XFCE or D-Bus could not be installed. Run: bash ~/alpine-bootstrap.sh"
-        return 1
-    fi
+    # Retry up to 3 times with cleanup between attempts.
+    local attempt=1 max_attempts=3
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4 && command -v dbus-launch' >/dev/null 2>&1; then
+            return 0
+        fi
+        echo "[!] Alpine desktop check failed (attempt $attempt/$max_attempts) — cleaning up and retrying..."
+        pkill -9 -f "proot-distro login" 2>/dev/null || true
+        sleep 1
+        rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X0-lock" 2>/dev/null || true
+        rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X11-unix/X0" 2>/dev/null || true
+        attempt=$((attempt + 1))
+    done
+    echo "[!] XFCE or D-Bus could not be installed. Run: bash ~/alpine-bootstrap.sh"
+    return 1
 }
 
 start_desktop() {
-    ensure_alpine
+    # Pre-flight: kill any stale proot/alpine processes from a crashed
+    # previous session. This is the primary fix for "alpine is busy".
+    echo "[*] Pre-flight cleanup..."
+    pkill -9 -f "proot-distro login" 2>/dev/null || true
+    pkill -9 -f "proot.*alpine" 2>/dev/null || true
+    pkill -9 -f "virgl_test_server_android" 2>/dev/null || true
+    pkill -9 -f "termux.x11" 2>/dev/null || true
+    pkill -9 -f "Xvnc" 2>/dev/null || true
+    pkill -9 -f "sensor-bridge.sh" 2>/dev/null || true
+    pkill -9 -f "ram-manager.sh" 2>/dev/null || true
+    sleep 1
+    rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X0-lock" 2>/dev/null || true
+    rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X11-unix/X0" 2>/dev/null || true
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
+
+    ensure_alpine || { echo "[!] Alpine is not ready. Run bash ~/alpine-bootstrap.sh and retry."; return 1; }
 
     # Clean only stale display/render processes so repeated starts stay reliable.
     pkill -f "virgl_test_server_android" 2>/dev/null || true
@@ -1325,12 +1423,32 @@ start_desktop() {
     echo "  [*] Sensors: run 'termux-sensor' inside Alpine"
     echo "----------------------------------------------"
 
-    # IMPORTANT: login options go before the distro. Alpine already enters as
-    # root by default, so --user root is unnecessary and broke older releases.
-    # Pass the selected renderer into the guest instead of forcing virpipe when
-    # VirGL failed to start.
-    PROOT_NO_SECCOMP=1 proot-distro login --shared-tmp alpine -- \
-        /bin/sh -lc "export DISPLAY=:0 GALLIUM_DRIVER='\$GALLIUM_DRIVER' MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp PULSE_SERVER=127.0.0.1; export NO_AT_BRIDGE=1; dbus-launch --exit-with-session startxfce4" 2>&1 | tee /tmp/droiddesk-xfce.log
+    # Brutal stability: retry proot login up to 3 times with cleanup between attempts.
+    # This fixes "alpine is busy" by killing stale sessions and retrying.
+    local attempt=1 max_attempts=3 login_ok=0
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if PROOT_NO_SECCOMP=1 proot-distro login --shared-tmp alpine -- \
+                /bin/sh -lc "export DISPLAY=:0 GALLIUM_DRIVER='\$GALLIUM_DRIVER' MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp PULSE_SERVER=127.0.0.1; export NO_AT_BRIDGE=1; dbus-launch --exit-with-session startxfce4" 2>&1 | tee /tmp/droiddesk-xfce.log; then
+            login_ok=1
+            break
+        fi
+        echo ""
+        echo "[!] Proot login failed (attempt $attempt/$max_attempts)."
+        echo "[!] Cleaning up stale processes and retrying..."
+        pkill -9 -f "proot-distro login" 2>/dev/null || true
+        pkill -9 -f "proot.*alpine" 2>/dev/null || true
+        sleep 2
+        rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X0-lock" 2>/dev/null || true
+        rm -f "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/.X11-unix/X0" 2>/dev/null || true
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$login_ok" -ne 1 ]; then
+        echo "[!] Proot login failed after $max_attempts attempts."
+        echo "[!] Run: bash ~/stop-proot.sh"
+        echo "[!] Then retry: bash ~/start-x11.sh"
+        echo "[!] If the problem persists, run: bash ~/fix-proot.sh"
+    fi
 }
 
 start_desktop
@@ -1752,8 +1870,8 @@ EOF
     cat > ~/Desktop/Chromium.desktop << 'EOF'
 [Desktop Entry]
 Name=Chromium
-Comment=Chromium browser (native) with uBlock Origin
-Exec=chromium --no-sandbox --ozone-platform-hint=auto %U
+Comment=Chromium browser inside proot with uBlock Origin
+Exec=bash /data/data/com.termux/files/home/chromium.sh
 Icon=chromium
 Type=Application
 Terminal=false

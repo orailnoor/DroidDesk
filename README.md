@@ -2,7 +2,7 @@
 
 A light, usable, no-root Linux desktop for any Android phone. Not a terminal. Not an emulator. A complete desktop environment with direct kernel access -- native Chromium browser, Blender, Metasploit, local AI, all of it.
 
-Designed to stay lightweight: it preinstalls Firefox (no proot needed to browse), skips heavy defaults like VS Code, includes a **visual `.deb` / AppImage installer** (a hidden Proot glibc backend runs the apps and adds them to your menu), and lets you keep the Linux backend on an **SD card** if internal storage is tight. By default everything lives inside Termux's private folder.
+Designed to stay lightweight: it preinstalls Chromium and Firefox ESR inside the Proot container, skips heavy defaults like VS Code, includes a **visual `.deb` / AppImage installer** (a hidden Proot glibc backend runs the apps and adds them to your menu), and lets you keep the Linux backend on an **SD card** if internal storage is tight. By default everything lives inside Termux's private folder.
 
 Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your entire setup comes with you.
 
@@ -14,7 +14,8 @@ Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your en
 
 Everything below has been tested and confirmed working:
 
-- **Firefox** -- Native Termux browser with **uBlock Origin** (runs without proot).
+- **Chromium** -- Inside the Proot container with uBlock Origin (force-installed via managed policy). GPU accelerated.
+- **Firefox ESR** -- Inside the Proot container with GPU acceleration.
 - **LibreOffice** -- Word processing, spreadsheets, presentations. Fully functional.
 - **VS Code** -- Full version (installed inside the container with `apt`). Python, PIP, extensions, everything.
 - **Claude Code** -- AI coding agent running directly in terminal.
@@ -23,7 +24,7 @@ Everything below has been tested and confirmed working:
 - **Metasploit** -- Pentesting framework, runs fine.
 - **Local AI** -- Offline LLM inference, 5+ tokens/second, no API needed.
 
-The backend now uses **Alpine Linux** to minimize storage and idle RAM on low-end phones. Packages inside the container are installed with `apk`.
+The backend uses **Alpine Linux** to minimize storage and idle RAM on low-end phones. Packages inside the container are installed with `apk`. All graphical apps run inside the Proot container for maximum compatibility and isolation.
 
 ## How It Works
 
@@ -32,6 +33,24 @@ The Linux environment runs through Termux with direct access to the phone's kern
 The setup script uses `proot-distro` to install a minimal Alpine container with XFCE4. Termux-X11 renders the desktop while `virglrenderer-android` exposes GPU acceleration through VirGL (`GALLIUM_DRIVER=virpipe`), keeping the session lean enough for entry-level devices.
 
 The automatic menu sync scans what you install inside Proot and adds it directly to your desktop app menu. No need to enter the container every time.
+
+All graphical apps (Chromium, Firefox ESR, LibreOffice, etc.) run inside the Proot container. The container is isolated from Termux's native environment, which prevents conflicts and makes the entire setup more stable.
+
+### "Alpine is busy" fix
+
+The "container alpine is busy" error was caused by stale proot processes and lock files from previous sessions that didn't shut down cleanly. The fix includes:
+- `~/stop-proot.sh` — kills every proot-related process and cleans up stale locks before starting a new session
+- Pre-flight cleanup in `start-x11.sh` — automatically kills stale processes and removes lock files on every launch
+- Retry logic with 3 attempts — if a login fails, the script cleans up and retries automatically
+- OpenRC services disabled inside Alpine — networking, hostname, and bootmisc services that conflict with proot are removed from auto-start
+
+### SD card storage
+
+The Linux container can be stored entirely on an SD card, freeing up internal storage. The setup script guides you through the process and automatically detects available SD cards. Key improvements:
+- SD card write-test before committing (rejects FAT/exFAT cards that can't hold a Linux rootfs)
+- Symlink-based storage — proot-distro's `installed-rootfs` points to the SD card transparently
+- Both the rootfs and cached data live on the SD card
+- `~/fix-proot.sh` diagnoses and repairs dangling SD symlinks automatically
 
 
 ## Requirements
@@ -116,6 +135,13 @@ auto-started by `start-x11.sh`) watches free RAM and, when it gets low, drops
 caches and silences idle non-critical background processes — without killing
 foreground apps, the browser, or the desktop session.
 
+If the Proot backend ever reports `container 'alpine' is busy` (common
+when it was not shut down cleanly), run `bash ~/stop-proot.sh` first — it
+kills every stale proot process and cleans up lock files. Then retry
+`bash ~/start-x11.sh`. The setup script also includes automatic retry
+logic (3 attempts with cleanup between each) so this error is rarely
+encountered during normal use.
+
 If the Proot backend ever reports `container 'alpine' is not installed` (common
 when it lives on an SD card that got unmounted), run `bash ~/fix-proot.sh` — it
 prints diagnostics, repairs a dangling SD link, and reinstalls the rootfs if
@@ -178,14 +204,17 @@ Add this line:
 |---|---|
 | `bash ~/start-x11.sh` | Start desktop via Termux-X11 |
 | `bash ~/start-vnc.sh` | Start desktop via VNC (if installed) |
-| `bash ~/chromium.sh` | Launch Chromium (with uBlock Origin) |
+| `bash ~/start-proot.sh` | Start a proot shell session |
+| `bash ~/chromium.sh` | Launch Chromium inside proot (with uBlock Origin) |
+| `bash ~/firefox.sh` | Launch Firefox ESR inside proot |
 | `bash ~/ram-manager.sh` | Start RAM manager manually |
 | `bash ~/device-info.sh` | Show device info (battery, wifi, gpu, ram) |
 | `bash ~/power-menu.sh` | Lock / sleep / reboot / power off |
 | `bash ~/lock-screen.sh` | Lock / turn off screen |
+| `bash ~/stop-proot.sh` | Kill all proot sessions and clean up (fixes "alpine is busy") |
+| `bash ~/stop-linux.sh` | Stop all sessions |
 | `bash ~/fix-proot.sh` | Diagnose / repair the Linux backend |
 | `bash ~/proot-menu-sync.sh` | Sync installed apps to desktop menu |
-| `bash ~/stop-linux.sh` | Stop all sessions |
 | `bash ~/update.sh` | Update to the latest scripts (keeps your config) |
 
 ## Updating
