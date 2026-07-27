@@ -578,29 +578,143 @@ step_proot() {
         fi
     fi
 
-    if [ "$PROOT_READY" = "1" ]; then
-        echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
-        # PROOT_NO_SECCOMP=1 keeps proot working on old Android kernels whose
-        # seccomp filters break syscall emulation.
-        PROOT_NO_SECCOMP=1 proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc "
-            apk update >/dev/null 2>&1
-            apk add --no-cache \
-                bash dbus dbus-x11 xfce4 xfce4-terminal \
-                mesa-dri-gallium mesa-egl mesa-gl mesa-utils \
-                papirus-icon-theme curl wget git htop nano >/dev/null 2>&1
-            mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml
-            cat > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml <<'ALPINE_XFCE'
-<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<channel name=\"xsettings\" version=\"1.0\">
-  <property name=\"Net\" type=\"empty\">
-    <property name=\"ThemeName\" type=\"string\" value=\"Fluent-Dark\"/>
-    <property name=\"IconThemeName\" type=\"string\" value=\"Papirus-Dark\"/>
+    # termux-api gives the sensor bridge access to accelerometer, gyro, light,
+    # GPS, battery, etc. (requires the Termux:API companion app).
+    install_pkg "termux-api" "Termux API (device sensors)"
+
+    # ---- alpine-bootstrap.sh ----
+    # Shared bootstrap: installs/repairs the whole Alpine desktop. Used by the
+    # setup here AND by start-x11.sh (auto-installs Alpine if it's missing).
+    cat > ~/alpine-bootstrap.sh << 'BOOTEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# DroidDesk — Alpine bootstrap / repair
+export PROOT_NO_SECCOMP=1
+PROOT_DISTRO="alpine"
+ROOTFS="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$PROOT_DISTRO"
+
+if [ ! -d "$ROOTFS/bin" ]; then
+    echo "[*] Alpine container not found — installing it now..."
+    proot-distro install "$PROOT_DISTRO" || {
+        echo "[!] Alpine install failed. Check internet/storage and retry."
+        exit 1
+    }
+fi
+
+echo "[*] Bootstrapping Alpine desktop (XFCE + Firefox + sensors + su)..."
+proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc '
+    # 1) Enable the community repo — XFCE, Firefox and Papirus live there.
+    #    Without this apk finds almost nothing and the desktop has no apps.
+    sed -i "s|^#\(.*/community\)$|\1|" /etc/apk/repositories 2>/dev/null || true
+    grep -q "/community" /etc/apk/repositories || \
+        echo "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community" >> /etc/apk/repositories
+    apk update
+
+    # 2) Full desktop stack. font-dejavu is REQUIRED: without fonts XFCE
+    #    renders a black/blank screen. desktop-file-utils + shared-mime-info
+    #    make app menu entries actually appear.
+    apk add --no-cache \
+        bash dbus dbus-x11 sudo shadow busybox-suid \
+        xfce4 xfce4-session xfce4-terminal xfce4-appfinder thunar \
+        xfce4-whiskermenu-plugin desktop-file-utils shared-mime-info \
+        mesa-dri-gallium mesa-egl mesa-gl mesa-utils \
+        font-dejavu adwaita-icon-theme papirus-icon-theme \
+        firefox-esr \
+        curl wget git htop nano
+
+    # 3) D-Bus needs a machine id or dbus-launch dies silently (black screen).
+    [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id
+    mkdir -p /run/dbus
+
+    # 4) Root support: sessions already run as root inside proot, and
+    #    busybox-suid + shadow give a working "su". Set a known password
+    #    and add a passwordless sudo policy for convenience.
+    printf "root:root\n" | chpasswd 2>/dev/null || true
+    mkdir -p /etc/sudoers.d
+    echo "root ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/droiddesk
+    chmod 0440 /etc/sudoers.d/droiddesk
+
+    # 5) Sensor client: talks to the Termux-side bridge over shared /tmp.
+    cat > /usr/local/bin/termux-sensor <<"SENSOREOF"
+#!/bin/sh
+# Reads Android sensors through the DroidDesk sensor bridge (shared /tmp).
+# Usage: termux-sensor            -> list sensors
+#        termux-sensor all        -> one reading of every sensor
+#        termux-sensor <name>     -> one reading of a specific sensor
+REQ=/tmp/droiddesk-sensor.req
+OUT=/tmp/droiddesk-sensor.out
+if [ ! -e /tmp/droiddesk-sensor.bridge ]; then
+    echo "Sensor bridge not running. Start the desktop with start-x11.sh" >&2
+    exit 1
+fi
+rm -f "$OUT"
+echo "${*:-list}" > "$REQ"
+i=0
+while [ $i -lt 40 ]; do
+    if [ -s "$OUT" ]; then cat "$OUT"; rm -f "$OUT"; exit 0; fi
+    sleep 0.25; i=$((i+1))
+done
+echo "Timed out waiting for sensor data." >&2
+exit 1
+SENSOREOF
+    chmod +x /usr/local/bin/termux-sensor
+    ln -sf /usr/local/bin/termux-sensor /usr/local/bin/device-sensors
+
+    # 6) Theme: Papirus icons now, Fluent window theme config prepared.
+    mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml
+    cat > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml <<"ALPINE_XFCE"
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xsettings" version="1.0">
+  <property name="Net" type="empty">
+    <property name="ThemeName" type="string" value="Fluent-Dark"/>
+    <property name="IconThemeName" type="string" value="Papirus-Dark"/>
   </property>
 </channel>
 ALPINE_XFCE
-        " 2>/dev/null || true
-        echo -e "  [+] ${PROOT_LABEL} ready (XFCE + Papirus; Fluent config prepared)."
+'
+echo "[+] Alpine desktop ready (XFCE + Firefox ESR + Papirus + su/sudo + sensors)."
+BOOTEOF
+    chmod +x ~/alpine-bootstrap.sh
+    echo -e "  [+] Created ~/alpine-bootstrap.sh"
+
+    if [ "$PROOT_READY" = "1" ]; then
+        echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
+        bash ~/alpine-bootstrap.sh > /dev/null 2>&1 || true
+        echo -e "  [+] ${PROOT_LABEL} ready (XFCE + Firefox ESR + Papirus + sensors + su)."
     fi
+
+    # ---- sensor-bridge.sh (Termux side) ----
+    # Serves Android sensor data to Alpine through the shared /tmp directory.
+    cat > ~/sensor-bridge.sh << 'SBEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# DroidDesk sensor bridge — answers requests from Alpine's termux-sensor client.
+TMP="${TMPDIR:-/data/data/com.termux/files/usr/tmp}"
+REQ="$TMP/droiddesk-sensor.req"
+OUT="$TMP/droiddesk-sensor.out"
+FLAG="$TMP/droiddesk-sensor.bridge"
+
+if ! command -v termux-sensor > /dev/null 2>&1; then
+    echo "[!] termux-api not installed (pkg install termux-api + Termux:API app)."
+    exit 1
+fi
+
+touch "$FLAG"
+trap 'rm -f "$FLAG" "$REQ" "$OUT"' EXIT INT TERM
+
+while :; do
+    if [ -s "$REQ" ]; then
+        args=$(cat "$REQ" 2>/dev/null); rm -f "$REQ"
+        case "$args" in
+            list|"") termux-sensor -l > "$OUT".tmp 2>&1 ;;
+            all)     termux-sensor -a -n 1 > "$OUT".tmp 2>&1 ;;
+            *)       termux-sensor -s "$args" -n 1 > "$OUT".tmp 2>&1 ;;
+        esac
+        mv -f "$OUT".tmp "$OUT" 2>/dev/null
+    fi
+    sleep 0.25
+done
+SBEOF
+    chmod +x ~/sensor-bridge.sh
+    echo -e "  [+] Created ~/sensor-bridge.sh (Android sensor bridge)"
 
     # The browser is native Chromium in Termux (installed in step_apps); the
     # Proot container is used only for proot-menu-sync (app menu bridge).
@@ -829,7 +943,7 @@ if [ ! -d "$PROOT_ROOTFS" ] && \
     exit 1
 fi
 if [ ! -d "$PROOT_APPS" ]; then
-    echo "[!] No proot apps yet. proot-distro login $PROOT_DISTRO -- apt install <pkg>"
+    echo "[!] No proot apps yet. proot-distro login $PROOT_DISTRO -- apk add <pkg>"
     exit 0
 fi
 
@@ -1099,41 +1213,81 @@ export LOGNAME="$SETUP_USERNAME"
 export HOSTNAME="android-linux"
 export HOST="android-linux"
 
+ensure_alpine() {
+    # Auto-install Alpine if the proot container is missing (first run,
+    # wiped storage, failed setup, etc.) so the desktop always comes up.
+    local rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/alpine"
+    if [ ! -d "\$rootfs/bin" ]; then
+        echo "[!] Alpine container not found — installing it now (one time)..."
+        if [ -f ~/alpine-bootstrap.sh ]; then
+            bash ~/alpine-bootstrap.sh || { echo "[!] Alpine install failed."; exit 1; }
+        else
+            PROOT_NO_SECCOMP=1 proot-distro install alpine || exit 1
+        fi
+    fi
+    # Make sure startxfce4 actually exists inside the container (repairs
+    # half-installed rootfs where the GUI packages never got installed).
+    if ! PROOT_NO_SECCOMP=1 proot-distro login alpine -- /bin/sh -lc 'command -v startxfce4' >/dev/null 2>&1; then
+        echo "[*] Alpine found but XFCE missing — bootstrapping desktop..."
+        [ -f ~/alpine-bootstrap.sh ] && bash ~/alpine-bootstrap.sh
+    fi
+}
+
 start_desktop() {
+    ensure_alpine
+
     # Clean only stale display/render processes so repeated starts stay reliable.
     pkill -f "virgl_test_server_android" 2>/dev/null || true
     pkill -f "termux.x11" 2>/dev/null || true
     pkill -f "Xvnc" 2>/dev/null || true
+    sleep 1
 
     unset PULSE_SERVER
     pulseaudio --kill 2>/dev/null || true
     pulseaudio --start --exit-idle-time=-1
     export PULSE_SERVER=127.0.0.1
 
-    echo "[*] Starting VirGL renderer..."
+    echo "[*] Starting VirGL renderer (GPU)..."
     virgl_test_server_android &
     VIRGL_PID=\$!
 
+    # -ac disables X access control: REQUIRED so the Alpine container can
+    # connect to the display. Without it the GUI never shows up.
     echo "[*] Starting Termux-X11 on :0..."
-    termux-x11 :0 &
+    termux-x11 :0 -ac &
     X11_PID=\$!
-    sleep 2
 
-    # Low-end defaults requested by DroidDesk. --shared-tmp exposes the X11 and
-    # VirGL sockets to Alpine without extra bind mounts or duplicate services.
+    # Wait for the X socket instead of a blind sleep (slow devices need more).
+    TERMUX_TMP="\${TMPDIR:-/data/data/com.termux/files/usr/tmp}"
+    for i in \$(seq 1 20); do
+        [ -e "\$TERMUX_TMP/.X11-unix/X0" ] && break
+        sleep 0.5
+    done
+
     export DISPLAY=:0
     export GALLIUM_DRIVER=virpipe
     export MESA_GL_VERSION_OVERRIDE=4.0
 
-    trap 'kill \$VIRGL_PID \$X11_PID 2>/dev/null || true' EXIT INT TERM
+    # Android sensor bridge (accelerometer, gyro, light, battery...).
+    if [ -f ~/sensor-bridge.sh ] && ! pgrep -f "sensor-bridge.sh" >/dev/null 2>&1; then
+        nohup bash ~/sensor-bridge.sh >/dev/null 2>&1 &
+    fi
+
+    trap 'kill \$VIRGL_PID \$X11_PID 2>/dev/null || true; pkill -f "sensor-bridge.sh" 2>/dev/null || true' EXIT INT TERM
 
     if [ -f ~/ram-manager.sh ] && ! pgrep -f "ram-manager.sh" >/dev/null 2>&1; then
         nohup bash ~/ram-manager.sh >/dev/null 2>&1 &
     fi
 
-    echo "[*] Entering Alpine XFCE (open the Termux-X11 app)..."
-    PROOT_NO_SECCOMP=1 proot-distro login alpine --shared-tmp -- \
-        /bin/sh -lc 'export DISPLAY=:0 GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp; dbus-launch --exit-with-session startxfce4'
+    echo "----------------------------------------------"
+    echo "  [*] Open the Termux-X11 app to see desktop"
+    echo "  [*] Root: session runs as root ('su' works)"
+    echo "  [*] Sensors: run 'termux-sensor' inside Alpine"
+    echo "----------------------------------------------"
+    # --shared-tmp shares Termux /tmp (X11 + VirGL sockets + sensor bridge)
+    # with Alpine. Session runs as root, so 'su' and 'sudo' both work.
+    PROOT_NO_SECCOMP=1 proot-distro login alpine --shared-tmp --user root -- \
+        /bin/sh -lc 'export DISPLAY=:0 GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp PULSE_SERVER=127.0.0.1; dbus-launch --exit-with-session startxfce4'
 }
 
 start_desktop
@@ -1147,6 +1301,7 @@ LAUNCHEREOF
 echo "Stopping all sessions..."
 pkill -9 -f "termux.x11" 2>/dev/null
 pkill -f "virgl_test_server_android" 2>/dev/null
+pkill -f "sensor-bridge.sh" 2>/dev/null
 vncserver -kill :1 2>/dev/null
 pkill -9 -f "Xvnc" 2>/dev/null
 pkill -9 -f "pulseaudio" 2>/dev/null
