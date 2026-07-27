@@ -391,6 +391,7 @@ step_gpu() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing GPU Acceleration...${NC}"
     echo ""
+    install_pkg "virglrenderer-android" "VirGL Renderer for Android"
     install_pkg "mesa-zink" "Mesa Zink Core"
     if [ "$GPU_DRIVER" == "freedreno" ]; then
         install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Driver"
@@ -508,10 +509,10 @@ step_proot() {
     install_pkg "proot" "PRoot"
 
     echo ""
-    # ── Hardcoded to Ubuntu (DroidDesk default) ──
-    PROOT_DISTRO="ubuntu"
-    PROOT_LABEL="Ubuntu 22.04"
-    # The container is a hidden backend for the .deb/AppImage installer. If it
+    # Alpine is the DroidDesk default: tiny rootfs and much lower idle RAM.
+    PROOT_DISTRO="alpine"
+    PROOT_LABEL="Alpine Linux"
+    # The container hosts the lightweight XFCE session and the app bridge. If it
     # fails to install we keep going anyway so the native scripts (Chromium,
     # Click n run, launchers) are still generated; the user can repair the
     # backend later with ~/fix-proot.sh.
@@ -531,7 +532,7 @@ step_proot() {
     #     echo "Please enter 1, 2, or 3."
     # done
     # case $PROOT_INPUT in
-    #     1) PROOT_DISTRO="ubuntu";         PROOT_LABEL="Ubuntu 22.04";;
+    #     1) PROOT_DISTRO="alpine";         PROOT_LABEL="Ubuntu 22.04";;
     #     2) PROOT_DISTRO="debian";         PROOT_LABEL="Debian 12";;
     #     3) PROOT_DISTRO="kali-nethunter"; PROOT_LABEL="Kali Linux";;
     # esac
@@ -581,46 +582,24 @@ step_proot() {
         echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
         # PROOT_NO_SECCOMP=1 keeps proot working on old Android kernels whose
         # seccomp filters break syscall emulation.
-        PROOT_NO_SECCOMP=1 proot-distro login "$PROOT_DISTRO" -- bash -c "
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y -q > /dev/null 2>&1
-            apt-get install -y -q --no-install-recommends \
-                mesa-utils vulkan-tools \
-                libgl1-mesa-glx libvulkan1 libgles2 \
-                xfce4 xfce4-terminal dbus-x11 \
-                sudo curl wget git htop nano > /dev/null 2>&1
+        PROOT_NO_SECCOMP=1 proot-distro login "$PROOT_DISTRO" -- /bin/sh -lc "
+            apk update >/dev/null 2>&1
+            apk add --no-cache \
+                bash dbus dbus-x11 xfce4 xfce4-terminal \
+                mesa-dri-gallium mesa-egl mesa-gl mesa-utils \
+                papirus-icon-theme curl wget git htop nano >/dev/null 2>&1
+            mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml
+            cat > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml <<'ALPINE_XFCE'
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<channel name=\"xsettings\" version=\"1.0\">
+  <property name=\"Net\" type=\"empty\">
+    <property name=\"ThemeName\" type=\"string\" value=\"Fluent-Dark\"/>
+    <property name=\"IconThemeName\" type=\"string\" value=\"Papirus-Dark\"/>
+  </property>
+</channel>
+ALPINE_XFCE
         " 2>/dev/null || true
-        echo -e "  [+] ${PROOT_LABEL} ready."
-
-        # ---- Create named user with working sudo ----
-        echo -e "  [*] Creating proot user: ${SETUP_USERNAME} (with sudo)..."
-        PROOT_NO_SECCOMP=1 proot-distro login "$PROOT_DISTRO" -- bash -c "
-        # Create user if not exists
-        id '$SETUP_USERNAME' > /dev/null 2>&1 || \
-            useradd -m -s /bin/bash '$SETUP_USERNAME'
-
-        # Add to sudo group
-        usermod -aG sudo '$SETUP_USERNAME' 2>/dev/null || true
-
-        # Drop-in sudoers file (cleaner than editing /etc/sudoers directly)
-        # Defaults !requiretty  — allows sudo without a real terminal (proot)
-        # NOPASSWD            — no password prompt
-        mkdir -p /etc/sudoers.d
-        echo 'Defaults !requiretty' > /etc/sudoers.d/proot-compat
-        echo '$SETUP_USERNAME ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers.d/proot-compat
-        chmod 0440 /etc/sudoers.d/proot-compat
-
-        # Ensure sudo binary has correct permissions (SETUID)
-        chmod u+s /usr/bin/sudo 2>/dev/null || true
-
-        # Nice coloured shell prompt
-        echo 'export PS1="\[\033[01;32m\]${SETUP_USERNAME}@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' \
-            >> /home/'$SETUP_USERNAME'/.bashrc
-        # Useful aliases
-        echo 'alias ll="ls -la"' >> /home/'$SETUP_USERNAME'/.bashrc
-        echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc
-    " 2>/dev/null || true
-        echo -e "  [+] Proot user '${SETUP_USERNAME}' created with passwordless sudo"
+        echo -e "  [+] ${PROOT_LABEL} ready (XFCE + Papirus; Fluent config prepared)."
     fi
 
     # The browser is native Chromium in Termux (installed in step_apps); the
@@ -657,10 +636,9 @@ _RC=\$(mktemp /data/data/com.termux/files/usr/tmp/proot_rc.XXXX)
 cat > "\$_RC" << 'RCEOF'
 export DISPLAY=:0
 export MESA_NO_ERROR=1
-export MESA_GL_VERSION_OVERRIDE=4.6
+export MESA_GL_VERSION_OVERRIDE=4.0
 export MESA_GLES_VERSION_OVERRIDE=3.2
-export GALLIUM_DRIVER=zink
-export MESA_LOADER_DRIVER_OVERRIDE=zink
+export GALLIUM_DRIVER=virpipe
 export TU_DEBUG=noconform
 export ZINK_DESCRIPTORS=lazy
 export MESA_VK_WSI_PRESENT_MODE=immediate
@@ -767,7 +745,7 @@ RMEOF
 export PROOT_NO_SECCOMP=1
 PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
 RF="$PREFIX_DIR/var/lib/proot-distro/installed-rootfs"
-DISTRO="ubuntu"
+DISTRO="alpine"
 
 echo "== P-noroot linux — Proot diagnostic & repair =="
 echo "PREFIX=$PREFIX_DIR"
@@ -826,7 +804,7 @@ FIXEOF
 # break syscall emulation. Must be exported before any proot login.
 export PROOT_NO_SECCOMP=1
 
-PROOT_DISTRO="${1:-ubuntu}"
+PROOT_DISTRO="${1:-alpine}"
 PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
 PROOT_BIN="$PREFIX_DIR/bin/proot-distro"
 PROOT_ROOTFS="$PREFIX_DIR/var/lib/proot-distro/installed-rootfs/$PROOT_DISTRO"
@@ -860,10 +838,10 @@ mkdir -p "$BRIDGE_DIR" "$WRAPPER_DIR"
 HAS_GPU="software"
 [ -d "/dev/dri" ] && HAS_GPU="zink"
 
-# Ensure dbus-x11 in proot (use bash -c so it works even without `which`)
-if ! "$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/bash -c 'command -v dbus-run-session' > /dev/null 2>&1; then
-    echo "[*] Installing dbus-x11 in proot..."
-    "$PROOT_BIN" login "$PROOT_DISTRO" -- apt-get install -y -q dbus-x11 > /dev/null 2>&1
+# Ensure D-Bus is available inside Alpine.
+if ! "$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -lc 'command -v dbus-launch' > /dev/null 2>&1; then
+    echo "[*] Installing D-Bus in Alpine..."
+    "$PROOT_BIN" login "$PROOT_DISTRO" -- apk add --no-cache dbus dbus-x11 > /dev/null 2>&1
 fi
 
 SYNCED=0
@@ -909,7 +887,7 @@ for desktop_file in "$PROOT_APPS"/*.desktop; do
         APP_CMD="$CLEAN_EXEC"
         if "$PROOT_BIN" login "$PROOT_DISTRO" -- \
                 ldconfig -p 2>/dev/null | grep -q "libvulkan.so.1"; then
-            EXTRA_ENV="export GALLIUM_DRIVER=zink; export MESA_GL_VERSION_OVERRIDE=4.6;"
+            EXTRA_ENV="export GALLIUM_DRIVER=virpipe; export MESA_GL_VERSION_OVERRIDE=4.0;"
             echo "  [+] Blender: Zink GPU mode"
         else
             EXTRA_ENV="export LIBGL_ALWAYS_SOFTWARE=1; export GALLIUM_DRIVER=llvmpipe; export MESA_GL_VERSION_OVERRIDE=4.5;"
@@ -938,10 +916,9 @@ echo "    X11=\$X11_DIR  BINDS=\$BINDS"
 export DISPLAY=:0
 export XDG_RUNTIME_DIR=/tmp
 export MESA_NO_ERROR=1
-export MESA_GL_VERSION_OVERRIDE=4.6
+export MESA_GL_VERSION_OVERRIDE=4.0
 export MESA_GLES_VERSION_OVERRIDE=3.2
-export GALLIUM_DRIVER=zink
-export MESA_LOADER_DRIVER_OVERRIDE=zink
+export GALLIUM_DRIVER=virpipe
 export TU_DEBUG=noconform
 export MESA_VK_WSI_PRESENT_MODE=immediate
 export ZINK_DESCRIPTORS=lazy
@@ -1003,14 +980,12 @@ step_launchers() {
 
     # GPU env config
     cat > ~/.config/linux-gpu.sh << EOF
-export MESA_NO_ERROR=1
-export MESA_GL_VERSION_OVERRIDE=4.6
+export DISPLAY=:0
+export GALLIUM_DRIVER=virpipe
+export MESA_GL_VERSION_OVERRIDE=4.0
 export MESA_GLES_VERSION_OVERRIDE=3.2
-export GALLIUM_DRIVER=zink
-export MESA_LOADER_DRIVER_OVERRIDE=zink
-export TU_DEBUG=noconform
-export MESA_VK_WSI_PRESENT_MODE=immediate
-export ZINK_DESCRIPTORS=lazy
+export MESA_NO_ERROR=1
+export XDG_RUNTIME_DIR=\${TMPDIR:-/data/data/com.termux/files/usr/tmp}
 export XDG_DATA_DIRS=/data/data/com.termux/files/usr/share:\${XDG_DATA_DIRS}
 export XDG_CONFIG_DIRS=/data/data/com.termux/files/usr/etc/xdg:\${XDG_CONFIG_DIRS}
 EOF
@@ -1124,39 +1099,44 @@ export LOGNAME="$SETUP_USERNAME"
 export HOSTNAME="android-linux"
 export HOST="android-linux"
 
-pkill -9 -f "termux.x11" 2>/dev/null
-pkill -9 -f "Xvnc" 2>/dev/null
-${KILL_CMD}
-pkill -9 -f "dbus" 2>/dev/null
+start_desktop() {
+    # Clean only stale display/render processes so repeated starts stay reliable.
+    pkill -f "virgl_test_server_android" 2>/dev/null || true
+    pkill -f "termux.x11" 2>/dev/null || true
+    pkill -f "Xvnc" 2>/dev/null || true
 
-unset PULSE_SERVER
-pulseaudio --kill 2>/dev/null
-sleep 0.5
-echo "[*] Starting audio..."
-pulseaudio --start --exit-idle-time=-1
-sleep 1
-pactl load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1 2>/dev/null
-export PULSE_SERVER=127.0.0.1
+    unset PULSE_SERVER
+    pulseaudio --kill 2>/dev/null || true
+    pulseaudio --start --exit-idle-time=-1
+    export PULSE_SERVER=127.0.0.1
 
-echo "[*] Starting Termux-X11 on :0..."
-termux-x11 :0 -ac &
-sleep 3
-export DISPLAY=:0
+    echo "[*] Starting VirGL renderer..."
+    virgl_test_server_android &
+    VIRGL_PID=\$!
 
-    # Sync proot apps into menu (background, non-blocking)
-    [ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh > /dev/null 2>&1 &
+    echo "[*] Starting Termux-X11 on :0..."
+    termux-x11 :0 &
+    X11_PID=\$!
+    sleep 2
 
-    # RAM Manager: every 30s, drops caches + kills idle non-critical heavy apps.
-    # Never touches foreground processes or the desktop.
-    if [ -f ~/ram-manager.sh ] && ! pgrep -f "ram-manager.sh" > /dev/null 2>&1; then
-        nohup bash ~/ram-manager.sh > /dev/null 2>&1 &
+    # Low-end defaults requested by DroidDesk. --shared-tmp exposes the X11 and
+    # VirGL sockets to Alpine without extra bind mounts or duplicate services.
+    export DISPLAY=:0
+    export GALLIUM_DRIVER=virpipe
+    export MESA_GL_VERSION_OVERRIDE=4.0
+
+    trap 'kill \$VIRGL_PID \$X11_PID 2>/dev/null || true' EXIT INT TERM
+
+    if [ -f ~/ram-manager.sh ] && ! pgrep -f "ram-manager.sh" >/dev/null 2>&1; then
+        nohup bash ~/ram-manager.sh >/dev/null 2>&1 &
     fi
 
-echo "----------------------------------------------"
-echo "  [*] Open the Termux-X11 app to see desktop"
-echo "----------------------------------------------"
-echo ""
-${EXEC_CMD}
+    echo "[*] Entering Alpine XFCE (open the Termux-X11 app)..."
+    PROOT_NO_SECCOMP=1 proot-distro login alpine --shared-tmp -- \
+        /bin/sh -lc 'export DISPLAY=:0 GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 XDG_RUNTIME_DIR=/tmp; dbus-launch --exit-with-session startxfce4'
+}
+
+start_desktop
 LAUNCHEREOF
     chmod +x ~/start-x11.sh
     echo -e "  [+] Created ~/start-x11.sh"
@@ -1166,6 +1146,7 @@ LAUNCHEREOF
 #!/data/data/com.termux/files/usr/bin/bash
 echo "Stopping all sessions..."
 pkill -9 -f "termux.x11" 2>/dev/null
+pkill -f "virgl_test_server_android" 2>/dev/null
 vncserver -kill :1 2>/dev/null
 pkill -9 -f "Xvnc" 2>/dev/null
 pkill -9 -f "pulseaudio" 2>/dev/null
@@ -1645,10 +1626,9 @@ step_vnc_optional() {
         cat > ~/.vnc/xstartup << VNCSTARTUP
 #!/data/data/com.termux/files/usr/bin/bash
 export MESA_NO_ERROR=1
-export MESA_GL_VERSION_OVERRIDE=4.6
+export MESA_GL_VERSION_OVERRIDE=4.0
 export MESA_GLES_VERSION_OVERRIDE=3.2
-export GALLIUM_DRIVER=zink
-export MESA_LOADER_DRIVER_OVERRIDE=zink
+export GALLIUM_DRIVER=virpipe
 export TU_DEBUG=noconform
 export ZINK_DESCRIPTORS=lazy
 export XDG_DATA_DIRS=/data/data/com.termux/files/usr/share:\${XDG_DATA_DIRS}
