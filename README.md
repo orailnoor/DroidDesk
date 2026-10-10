@@ -230,4 +230,4 @@ reproducible-build, custom-prefix bootstrap, and wallpaper-license work. Do not
 describe a binary release as fully compliant until the blocking checklist items
 are complete.
 
-Credit to the original author: 
+Credit to the original author: orailnoor - https://github.com/orailnoor
