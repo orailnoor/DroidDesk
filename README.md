@@ -1,4 +1,5 @@
 # DroidDesk
+This fork is only for my personal usage, in this case I am trying to use it on my Mate 20 Pro that was taking dust in drawer.
 
 Run a full Linux desktop on any Android phone. Not a terminal. Not an emulator. A complete desktop environment with direct kernel access -- VS Code, Blender, Metasploit, local AI, all of it.
 
@@ -228,3 +229,5 @@ The current compliance checklist includes unresolved source provenance,
 reproducible-build, custom-prefix bootstrap, and wallpaper-license work. Do not
 describe a binary release as fully compliant until the blocking checklist items
 are complete.
+
+Credit to the original author: 
