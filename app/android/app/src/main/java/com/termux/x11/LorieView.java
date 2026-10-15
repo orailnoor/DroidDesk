@@ -610,7 +610,7 @@ public class LorieView extends SurfaceView implements InputStub {
             MainActivity.handler.post(() -> {
                 if (MainActivity.getInstance() != null) {
                     LorieView.this.surfaceChanged(holder.getSurface());
-                    updateViewport();
+                    reload();
                 }
             });
         }
@@ -622,7 +622,7 @@ public class LorieView extends SurfaceView implements InputStub {
             height = getMeasuredHeight();
 
             Log.d("SurfaceChangedListener", "Surface was changed: " + width + "x" + height);
-            updateViewport();
+            reload();
         }
 
         @Override public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
@@ -670,6 +670,25 @@ public class LorieView extends SurfaceView implements InputStub {
     public void triggerCallback() {
         requestFocus();
         updateViewport();
+    }
+
+    public void reload() {
+        requestFocus();
+        int framerate = (int) (getDisplay() != null ? getDisplay().getRefreshRate() : 30);
+        String name;
+        if (getDisplay() == null || getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY)
+            name = "builtin";
+        else if (SamsungDexUtils.checkDeXEnabled(MainActivity.getInstance()))
+            name = "dex";
+        else
+            name = "external";
+
+        if (p.x > 1 && p.y > 1) {
+            // Momentarily nudge RandR geometry by 1px to force X11 compositor to
+            // reallocate and resend a fresh root buffer for the recreated Android surface.
+            sendWindowChange(p.x, p.y - 1, framerate, name);
+        }
+        postDelayed(this::updateViewport, 50);
     }
 
     void getDimensionsFromSettings(int width, int height) {

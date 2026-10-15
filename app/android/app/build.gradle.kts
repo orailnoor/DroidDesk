@@ -20,7 +20,7 @@ val releaseStoreFile = releaseSetting("storeFile", "DROIDDESK_KEYSTORE")
 android {
     namespace = "com.orailnoor.droiddesk"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "26.3.11579264"
 
     buildFeatures {
         aidl = true

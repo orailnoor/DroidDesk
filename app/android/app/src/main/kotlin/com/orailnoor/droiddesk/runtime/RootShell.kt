@@ -69,12 +69,16 @@ class RootShell(private val context: Context) {
     /**
      * Returns true if root access is available and granted.
      */
-    fun hasRoot(): Boolean {
-        cachedRootState?.let { return it }
+    fun hasRoot(forceRefresh: Boolean = false): Boolean {
+        if (!forceRefresh) {
+            cachedRootState?.let { return it }
+        }
         val su = findSuPath() ?: return false
         val result = execSync(su, "id -u")
         val hasRoot = result.trim() == "0"
-        cachedRootState = hasRoot
+        if (hasRoot) {
+            cachedRootState = true
+        }
         Log.i(TAG, "Root check: $hasRoot (su=$su)")
         return hasRoot
     }

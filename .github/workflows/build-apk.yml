@@ -1,0 +1,72 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master", "fix-resume-input-loss" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build DroidDesk APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: false
+
+      - name: Configure Android SDK, NDK, and Licenses
+        run: |
+          echo "ANDROID_HOME: $ANDROID_HOME"
+          yes | flutter doctor --android-licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" || true
+
+      - name: Get Flutter dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build Debug APK
+        working-directory: app
+        run: |
+          flutter build apk --debug --target-platform android-arm64 -v > build.log 2>&1 || {
+            echo "::error::=== KOTLIN / COMPILER ERRORS ==="
+            grep -E "e: |error: " build.log | head -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          }
+
+      - name: Build Release APK
+        working-directory: app
+        run: |
+          flutter build apk --release --target-platform android-arm64 -v >> build.log 2>&1 || {
+            echo "::warning::Release build failed, debug build will be used"
+          }
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: app/build.log
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DroidDesk-APKs
+          path: |
+            **/outputs/apk/**/*.apk
+            **/outputs/flutter-apk/*.apk

@@ -20,7 +20,7 @@ class X11InputController(
     /** Input mode the user picked last time; survives app restarts. */
     private val savedModes = lorieView.context.getSharedPreferences("desktop_input", android.content.Context.MODE_PRIVATE)
 
-    var mode: Int = savedModes.getInt(KEY_MODE, TouchInputHandler.InputMode.TRACKPAD)
+    var mode: Int = savedModes.getInt(KEY_MODE, TouchInputHandler.InputMode.SIMULATED_TOUCH)
         private set
 
     init {
@@ -36,9 +36,9 @@ class X11InputController(
 
     fun nextMode(): Int {
         val next = when (mode) {
-            TouchInputHandler.InputMode.TRACKPAD -> TouchInputHandler.InputMode.SIMULATED_TOUCH
-            TouchInputHandler.InputMode.SIMULATED_TOUCH -> TouchInputHandler.InputMode.TOUCH
-            else -> TouchInputHandler.InputMode.TRACKPAD
+            TouchInputHandler.InputMode.SIMULATED_TOUCH -> TouchInputHandler.InputMode.TRACKPAD
+            TouchInputHandler.InputMode.TRACKPAD -> TouchInputHandler.InputMode.TOUCH
+            else -> TouchInputHandler.InputMode.SIMULATED_TOUCH
         }
         setMode(next)
         return next
@@ -48,6 +48,16 @@ class X11InputController(
         TouchInputHandler.InputMode.SIMULATED_TOUCH -> "Touchscreen"
         TouchInputHandler.InputMode.TOUCH -> "Direct touch"
         else -> "Trackpad"
+    }
+
+    fun reacquireFocus() {
+        lorieView.requestFocus()
+        val prefs = MainActivity.getPrefs()
+        prefs.touchMode.put(mode.toString())
+        inputHandler.reloadPreferences(prefs)
+        if (prefs.pointerCapture.get() && !lorieView.hasPointerCapture()) {
+            lorieView.requestPointerCapture()
+        }
     }
 
     fun dispose() {

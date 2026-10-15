@@ -100,12 +100,12 @@ public class MainActivity extends Activity {
         android.util.Log.e("MainActivity", "clientConnectedStateChanged called by native code!");
         if (lorieView != null) {
             handler.postDelayed(() -> {
-                android.util.Log.e("MainActivity", "Executing triggerCallback from MainActivity handler!");
-                lorieView.triggerCallback();
+                android.util.Log.e("MainActivity", "Executing reload from MainActivity handler!");
+                lorieView.reload();
             }, 200);
-            handler.postDelayed(() -> lorieView.triggerCallback(), 500);
-            handler.postDelayed(() -> lorieView.triggerCallback(), 1000);
-            handler.postDelayed(() -> lorieView.triggerCallback(), 2000);
+            handler.postDelayed(() -> lorieView.reload(), 500);
+            handler.postDelayed(() -> lorieView.reload(), 1000);
+            handler.postDelayed(() -> lorieView.reload(), 2000);
         } else {
             android.util.Log.e("MainActivity", "lorieView is NULL in MainActivity!");
         }
