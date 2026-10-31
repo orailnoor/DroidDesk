@@ -406,7 +406,7 @@ PROOTEOF
 
 PROOT_DISTRO="${1:-ubuntu}"
 PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
-PROOT_ROOTFS="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$PROOT_DISTRO"
+PROOT_ROOTFS="/data/data/com.termux/files/usr/var/lib/proot-distro/containers/$PROOT_DISTRO/rootfs"
 PROOT_APPS="$PROOT_ROOTFS/usr/share/applications"
 BRIDGE_DIR="$HOME/.local/share/applications/proot-bridge"
 WRAPPER_DIR="$HOME/.local/share/proot-wrappers"
