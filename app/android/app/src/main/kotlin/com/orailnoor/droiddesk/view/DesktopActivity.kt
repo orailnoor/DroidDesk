@@ -29,6 +29,7 @@ import android.widget.ImageView
 import android.widget.TextView
 import android.view.Gravity
 import android.content.Intent
+import android.content.Context
 import android.content.res.ColorStateList
 import com.orailnoor.droiddesk.R
 import com.orailnoor.droiddesk.service.DroidDeskService
@@ -69,6 +70,11 @@ class DesktopActivity : Activity() {
     private var logoAnimator: FloatingLogoAnimator? = null
     private var surfaceCallback: SurfaceHolder.Callback? = null
     private var intentListenerThread: Thread? = null
+    private val batteryReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: android.content.Intent?) {
+            linuxRuntime.updateBatteryStatus()
+        }
+    }
     private var loadingOverlay: FrameLayout? = null
     private var loadingStatus: TextView? = null
     private var loadingEstimate: TextView? = null
@@ -155,8 +161,16 @@ class DesktopActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enableImmersiveMode()
-        if (hasFocus) startClipboardSync() else clipboardSync?.stop()
+        if (hasFocus) {
+            enableImmersiveMode()
+            startClipboardSync()
+            lorieView?.post {
+                lorieView?.requestFocus()
+                lorieView?.reload()
+            }
+        } else {
+            clipboardSync?.stop()
+        }
         if (hasFocus && !isSetupDone) {
             isSetupDone = true
             Log.i(TAG, "Window focused — setting up LorieView")
@@ -164,10 +178,70 @@ class DesktopActivity : Activity() {
         }
     }
 
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+            return super.dispatchKeyEvent(event)
+        }
+        if (TermuxMainActivity.getInstance().handleKey(event)) {
+            return true
+        }
+        if (lorieView?.dispatchKeyEvent(event) == true) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (lorieView?.dispatchGenericMotionEvent(event) == true) {
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val collapsed = collapsedControl
+        if (collapsed != null && collapsed.visibility == View.VISIBLE) {
+            val rect = android.graphics.Rect()
+            collapsed.getGlobalVisibleRect(rect)
+            if (rect.contains(event.x.toInt(), event.y.toInt())) {
+                return super.dispatchTouchEvent(event)
+            }
+        }
+        val control = controlOverlay
+        if (control != null && control.visibility == View.VISIBLE) {
+            val rect = android.graphics.Rect()
+            control.getGlobalVisibleRect(rect)
+            if (rect.contains(event.x.toInt(), event.y.toInt())) {
+                return super.dispatchTouchEvent(event)
+            }
+        }
+        if (event.action == MotionEvent.ACTION_DOWN && lorieView?.isFocused == false) {
+            lorieView?.requestFocus()
+        }
+        val lv = lorieView
+        if (lv != null) {
+            return lv.dispatchTouchEvent(event)
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
     override fun onResume() {
         super.onResume()
         enableImmersiveMode()
         restartSessionIfStopped()
+        try {
+            val filter = android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(batteryReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(batteryReceiver, filter)
+            }
+        } catch (e: Exception) {}
+        lorieView?.post {
+            lorieView?.requestFocus()
+            lorieView?.reload()
+            inputController?.reacquireFocus()
+        }
     }
 
     private fun isSessionRunning(): Boolean =
@@ -212,6 +286,9 @@ class DesktopActivity : Activity() {
 
     override fun onPause() {
         clipboardSync?.stop()
+        try {
+            unregisterReceiver(batteryReceiver)
+        } catch (e: Exception) {}
         super.onPause()
     }
 
@@ -252,9 +329,10 @@ class DesktopActivity : Activity() {
         TermuxMainActivity.getInstance().initLorieView(this)
         lorieView = TermuxMainActivity.getInstance().lorieView
 
-        // Keep Android overlay controls above the X11 SurfaceView.
-        lorieView!!.setZOrderOnTop(false)
-        placeholder.setBackgroundColor(Color.BLACK)
+        // Keep Android overlay controls above the X11 SurfaceView while preventing
+        // the window background from covering the surface.
+        lorieView!!.setZOrderMediaOverlay(true)
+        placeholder.setBackgroundColor(Color.TRANSPARENT)
 
         val params = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -280,6 +358,8 @@ class DesktopActivity : Activity() {
                     if (!connectionRequested) {
                         connectionRequested = true
                         connectToX11Service()
+                    } else {
+                        lorieView?.reload()
                     }
                 }
             }

@@ -247,30 +247,36 @@ public class TouchInputHandler {
         this(activity, null, injector, false);
     }
 
+    private static boolean sLastStylus = false;
+    private static boolean sLastKeyboard = false;
+    private static boolean sInitialCheckDone = false;
+
     static public void refreshInputDevices() {
-        AtomicBoolean stylusAvailable = new AtomicBoolean(false);
-        AtomicBoolean externalKeyboardAvailable = new AtomicBoolean(false);
-        android.util.Log.d("DEVICES", "external keyboard connected " + stylusAvailable.get());
-        Arrays.stream(InputDevice.getDeviceIds())
-                .mapToObj(InputDevice::getDevice)
-                .filter(Objects::nonNull)
-                .forEach((device) -> {
-                    //noinspection DataFlowIssue
-                    android.util.Log.d("DEVICES", "found device \"" + device.getName() + "\" " +
-                            (device.supportsSource(InputDevice.SOURCE_STYLUS) ? ((isExternal(device) ? "external " : "") + "stylus ") : "") +
-                            ((device.supportsSource(InputDevice.SOURCE_KEYBOARD) && device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC) ? ((isExternal(device) ? "external " : "") + "keyboard ") : "") +
-                            "sources " + String.format("0x%08X", device.getSources()));
+        boolean stylusAvailable = false;
+        boolean externalKeyboardAvailable = false;
+        int[] ids = InputDevice.getDeviceIds();
+        for (int id : ids) {
+            InputDevice device = InputDevice.getDevice(id);
+            if (device == null) continue;
+            if (device.supportsSource(InputDevice.SOURCE_STYLUS)) {
+                stylusAvailable = true;
+            }
+            if (device.supportsSource(InputDevice.SOURCE_KEYBOARD) &&
+                    device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC &&
+                    isExternal(device)) {
+                externalKeyboardAvailable = true;
+            }
+        }
 
-                    if (device.supportsSource(InputDevice.SOURCE_STYLUS))
-                        stylusAvailable.set(true);
-
-                    if (device.supportsSource(InputDevice.SOURCE_KEYBOARD) && device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC && isExternal(device))
-                        externalKeyboardAvailable.set(true);
-                });
-        android.util.Log.d("DEVICES", "requesting stylus " + stylusAvailable.get());
-        android.util.Log.d("DEVICES", "external keyboard connected " + externalKeyboardAvailable.get());
-        LorieView.requestStylusEnabled(stylusAvailable.get());
-        MainActivity.getInstance().setExternalKeyboardConnected(externalKeyboardAvailable.get());
+        if (!sInitialCheckDone || stylusAvailable != sLastStylus || externalKeyboardAvailable != sLastKeyboard) {
+            sInitialCheckDone = true;
+            sLastStylus = stylusAvailable;
+            sLastKeyboard = externalKeyboardAvailable;
+            android.util.Log.d("DEVICES", "Input devices updated: stylus=" + stylusAvailable +
+                    ", externalKeyboard=" + externalKeyboardAvailable);
+            LorieView.requestStylusEnabled(stylusAvailable);
+            MainActivity.getInstance().setExternalKeyboardConnected(externalKeyboardAvailable);
+        }
     }
 
     boolean isDexEvent(MotionEvent event) {
@@ -406,10 +412,16 @@ public class TouchInputHandler {
     }
 
     public void setCapturingEnabled(boolean enabled) {
-        if (mInjector.pointerCapture && enabled)
-            mActivity.getLorieView().requestPointerCapture();
-        else
-            mActivity.getLorieView().releasePointerCapture();
+        LorieView lorieView = mActivity.getLorieView();
+        if (lorieView != null) {
+            if (mInjector.pointerCapture && enabled) {
+                if (!lorieView.hasPointerCapture())
+                    lorieView.requestPointerCapture();
+            } else {
+                if (lorieView.hasPointerCapture())
+                    lorieView.releasePointerCapture();
+            }
+        }
 
         if (mInjector.pauseKeyInterceptingWithEsc) {
             if (mInjector.dexMetaKeyCapture)
@@ -463,10 +475,12 @@ public class TouchInputHandler {
 
         MainActivity.getRealMetrics(mMetrics);
 
-        if (!p.pointerCapture.get() && mActivity.getLorieView().hasPointerCapture())
-            mActivity.getLorieView().releasePointerCapture();
+        LorieView lorieView = mActivity.getLorieView();
+        boolean hasCapture = lorieView != null && lorieView.hasPointerCapture();
+        if (!p.pointerCapture.get() && hasCapture)
+            lorieView.releasePointerCapture();
 
-        keyIntercepting = !mInjector.pauseKeyInterceptingWithEsc || mActivity.getLorieView().hasPointerCapture();
+        keyIntercepting = !mInjector.pauseKeyInterceptingWithEsc || hasCapture;
         SamsungDexUtils.dexMetaKeyCapture(mActivity, mInjector.dexMetaKeyCapture && keyIntercepting);
 
         swipeUpAction = extractUserActionFromPreferences(p, "swipeUp");
