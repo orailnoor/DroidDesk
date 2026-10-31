@@ -19,6 +19,7 @@ DE_CHOICE="1"
 DE_NAME="XFCE4"
 VNC_ENABLED=false
 SETUP_USERNAME="user"
+INSTALL_LOG="$HOME/droiddesk-install.log"
 
 # Wallpaper URL — Ubuntu 4K wallpaper (set by user)
 WALLPAPER_URL="https://wallpapercave.com/download/ubuntu-4k-wallpapers-wp8303186"
@@ -77,7 +78,7 @@ install_pkg() {
     local pkg=$1
     local name=${2:-$pkg}
     (DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::="--force-confold" $pkg > /dev/null 2>&1) &
+        -o Dpkg::Options::="--force-confold" $pkg >> "$INSTALL_LOG" 2>&1) &
     spinner $! "Installing ${name}..."
 }
 
@@ -176,6 +177,8 @@ step_repos() {
     echo ""
     install_pkg "x11-repo" "X11 Repository"
     install_pkg "tur-repo" "TUR Repository"
+    (DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$INSTALL_LOG" 2>&1) &
+    spinner $! "Refreshing package lists..."
 }
 
 # ============== STEP 3: TERMUX-X11 ==============
@@ -221,11 +224,13 @@ step_gpu() {
     update_progress
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing GPU Acceleration...${NC}"
     echo ""
-    install_pkg "mesa-zink" "Mesa Zink Core"
+    install_pkg "mesa" "Mesa (incl. Zink)"
     if [ "$GPU_DRIVER" == "freedreno" ]; then
+        install_pkg "vulkan-loader-generic" "Vulkan Loader"
         install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Driver"
+    else
+        install_pkg "vulkan-loader-android" "Vulkan Loader"
     fi
-    install_pkg "vulkan-loader-android" "Vulkan Loader"
 }
 
 # ============== STEP 6: AUDIO ==============
@@ -297,7 +302,7 @@ step_proot() {
     # esac
 
     echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL}...${NC}"
-    (proot-distro install "$PROOT_DISTRO" > /dev/null 2>&1) &
+    (proot-distro install "$PROOT_DISTRO" >> "$INSTALL_LOG" 2>&1) &
     spinner $! "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
 
     echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
@@ -306,10 +311,10 @@ step_proot() {
         apt-get update -y -q > /dev/null 2>&1
         apt-get install -y -q --no-install-recommends \
             mesa-utils vulkan-tools \
-            libgl1-mesa-glx libvulkan1 libgles2 \
-            xfce4 xfce4-terminal dbus-x11 \
-            sudo curl wget git htop nano > /dev/null 2>&1
-    " 2>/dev/null || true
+            libgl1 libegl1 libvulkan1 libgles2 \
+            xfce4-terminal dbus-x11 \
+            sudo curl wget git htop nano
+    " >> "$INSTALL_LOG" 2>&1 || echo -e "  ${RED}[-] proot package install failed (see $INSTALL_LOG)${NC}"
     echo -e "  [+] ${PROOT_LABEL} ready."
 
     # ---- Create named user with working sudo ----
@@ -333,13 +338,15 @@ step_proot() {
         # Ensure sudo binary has correct permissions (SETUID)
         chmod u+s /usr/bin/sudo 2>/dev/null || true
 
-        # Nice coloured shell prompt
-        echo 'export PS1="\[\033[01;32m\]${SETUP_USERNAME}@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' \
-            >> /home/'$SETUP_USERNAME'/.bashrc
-        # Useful aliases
-        echo 'alias ll="ls -la"' >> /home/'$SETUP_USERNAME'/.bashrc
-        echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc
-    " 2>/dev/null || true
+    " >> "$INSTALL_LOG" 2>&1 || true
+    # Shell prompt + aliases, passed via stdin to avoid nested quoting
+    proot-distro login "$PROOT_DISTRO" -- bash -c \
+        'cat >> "$(getent passwd "$1" | cut -d: -f6)/.bashrc"' _ "$SETUP_USERNAME" \
+        >> "$INSTALL_LOG" 2>&1 << BASHRCEOF || true
+export PS1="\[\033[01;32m\]${SETUP_USERNAME}@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\\$ "
+alias ll="ls -la"
+alias update="sudo apt update && sudo apt upgrade -y"
+BASHRCEOF
     echo -e "  [+] Proot user '${SETUP_USERNAME}' created with passwordless sudo"
 
     PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
@@ -388,7 +395,7 @@ echo " Type 'exit' to leave proot."
 echo ""
 RCEOF
 
-proot-distro login "\$PROOT_DISTRO" \$BINDS --user root -- bash --rcfile "\$_RC"
+proot-distro login \$BINDS --user root "\$PROOT_DISTRO" -- bash --rcfile "\$_RC"
 rm -f "\$_RC"
 PROOTEOF
     chmod +x ~/start-proot.sh
@@ -406,7 +413,9 @@ PROOTEOF
 
 PROOT_DISTRO="${1:-ubuntu}"
 PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
-PROOT_ROOTFS="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$PROOT_DISTRO"
+PD_DIR="/data/data/com.termux/files/usr/var/lib/proot-distro"
+PROOT_ROOTFS="$PD_DIR/containers/$PROOT_DISTRO/rootfs"
+[ -d "$PROOT_ROOTFS" ] || PROOT_ROOTFS="$PD_DIR/installed-rootfs/$PROOT_DISTRO"
 PROOT_APPS="$PROOT_ROOTFS/usr/share/applications"
 BRIDGE_DIR="$HOME/.local/share/applications/proot-bridge"
 WRAPPER_DIR="$HOME/.local/share/proot-wrappers"
@@ -497,7 +506,7 @@ X11_DIR="\$TERMUX_TMP/.X11-unix"
 {
 echo "[+] Launching $appname at \$(date)"
 echo "    X11=\$X11_DIR  BINDS=\$BINDS"
-\$PROOT_BIN login "\$PROOT_DISTRO" \$BINDS -- /bin/bash -c "
+\$PROOT_BIN login \$BINDS "\$PROOT_DISTRO" -- /bin/bash -c "
 export DISPLAY=:0
 export XDG_RUNTIME_DIR=/tmp
 export MESA_NO_ERROR=1
@@ -528,7 +537,7 @@ WRAPEOF
 done
 
 echo "[+] Bridge: $SYNCED synced, $REMOVED removed."
-echo "    Logs: \$TERMUX_TMP/proot-<appname>.log"
+echo "    Logs: $TERMUX_TMP/proot-<appname>.log"
 echo "    Re-run after new installs: bash ~/proot-menu-sync.sh"
 
 pgrep -x "xfce4-panel" > /dev/null 2>&1 && xfce4-panel --restart > /dev/null 2>&1 &
@@ -824,11 +833,11 @@ FREOF
     chmod +x ~/.config/xfce-first-run.sh
 
     # Register as XFCE autostart (one-shot)
-    cat > ~/.config/autostart/xfce-first-run.desktop << 'AREOF'
+    cat > ~/.config/autostart/xfce-first-run.desktop << AREOF
 [Desktop Entry]
 Type=Application
 Name=XFCE First Run Setup
-Exec=bash /root/.config/xfce-first-run.sh
+Exec=bash $HOME/.config/xfce-first-run.sh
 Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
@@ -917,7 +926,7 @@ EOF
 [Desktop Entry]
 Name=Linux Container
 Comment=Open Proot Shell with GPU support
-Exec=${term_cmd} -e "bash /root/start-proot.sh"
+Exec=${term_cmd} -e "bash $HOME/start-proot.sh"
 Icon=system-run
 Type=Application
 Terminal=false
@@ -1094,7 +1103,7 @@ main() {
     # Apply username to native Termux shell prompt
     BASHRC="$HOME/.bashrc"
     grep -q "SETUP_USERNAME_PROMPT" "$BASHRC" 2>/dev/null || \
-        echo "# SETUP_USERNAME_PROMPT\nexport PS1='\[\033[01;32m\]${SETUP_USERNAME}@android\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '" >> "$BASHRC"
+        printf '%s\n' "# SETUP_USERNAME_PROMPT" "export PS1='\[\033[01;32m\]${SETUP_USERNAME}@android\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '" >> "$BASHRC"
     source "$BASHRC" 2>/dev/null || true
 
     show_completion
