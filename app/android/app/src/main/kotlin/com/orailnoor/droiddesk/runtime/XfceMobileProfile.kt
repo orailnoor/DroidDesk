@@ -132,22 +132,7 @@ object XfceMobileProfile {
     private fun installAutoMaximize(homeDir: File) {
         File(homeDir, ".config/devilspie2/droiddesk-maximize.lua").apply {
             parentFile?.mkdirs()
-            writeText(
-                """
-                -- Managed by DroidDesk: dialogs, menus and splash screens keep their own size.
-                if get_window_type() == "WINDOW_TYPE_NORMAL" then
-                  -- Fit the window to the screen first so "restore" returns to a size
-                  -- that is still usable on a phone, then open it maximized.
-                  if get_screen_geometry then
-                    local screen_w, screen_h = get_screen_geometry()
-                    local w = math.floor(screen_w * 0.9)
-                    local h = math.floor(screen_h * 0.8)
-                    set_window_geometry(math.floor((screen_w - w) / 2), math.floor((screen_h - h) / 2), w, h)
-                  end
-                  maximize()
-                end
-                """.trimIndent() + "\n",
-            )
+            writeText(XfceDisplayProfile.maximizeScript() + "\n")
         }
         File(homeDir, ".config/autostart/droiddesk-automax.desktop").apply {
             parentFile?.mkdirs()

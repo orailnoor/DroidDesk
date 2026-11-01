@@ -11,6 +11,7 @@ import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/screens/setup/de_install_screen.dart';
 import 'package:droiddesk/screens/apps/app_catalog_screen.dart';
 import 'package:droiddesk/screens/desktop_tools_screen.dart';
+import 'package:droiddesk/screens/display_settings_screen.dart';
 
 /// Home dashboard — shown after setup is complete.
 /// Central hub for launching the desktop, terminal, and managing the environment.
@@ -130,6 +131,21 @@ class HomeScreen extends StatelessWidget {
               ),
 
               // ── Running / finished App Store install, pinned ──
+              if (state.desktopDisplayError != null) SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+                  child: Card(child: ListTile(
+                    leading: const Icon(Icons.monitor, color: DroidTheme.error),
+                    title: Text(state.desktopDisplayError!),
+                    trailing: TextButton(
+                      onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => const DisplaySettingsScreen(),
+                      )),
+                      child: const Text('Displays'),
+                    ),
+                  )),
+                ),
+              ),
               SliverToBoxAdapter(
                 child: PackageOperationCard(
                   showResult: true,
@@ -236,6 +252,16 @@ class HomeScreen extends StatelessWidget {
                               const SizedBox(height: 10),
 
                               // ── Terminal ──
+                              _ActionCard(
+                                icon: Icons.monitor_rounded,
+                                title: 'Displays and scaling',
+                                subtitle: 'Open on monitor and adjust independent UI scale',
+                                color: DroidTheme.secondary,
+                                onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                                  builder: (_) => const DisplaySettingsScreen(),
+                                )),
+                              ),
+                              const SizedBox(height: 10),
                               _ActionCard(
                                 icon: Icons.terminal_rounded,
                                 title: 'Terminal',

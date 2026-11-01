@@ -16,6 +16,9 @@ val releaseKeystore = Properties().apply {
 fun releaseSetting(property: String, env: String): String? =
     (releaseKeystore.getProperty(property) ?: System.getenv(env))?.trim()?.takeIf { it.isNotEmpty() }
 val releaseStoreFile = releaseSetting("storeFile", "DROIDDESK_KEYSTORE")
+val acceptanceBuild = providers.gradleProperty("droiddeskAcceptanceBuild")
+    .map { it.toBooleanStrict() }
+    .getOrElse(false)
 
 android {
     namespace = "com.orailnoor.droiddesk"
@@ -37,8 +40,10 @@ android {
 
     defaultConfig {
         applicationId = "com.orailnoor.droiddesk"
+        manifestPlaceholders["appLabel"] = "DroidDesk"
         minSdk = 28  // Downgraded to 28 to bypass W^X (Write XOR Execute) restrictions on app data
         targetSdk = 28 // API 28 completely disables the Android 10+ execve() block
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
@@ -60,6 +65,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            if (acceptanceBuild) {
+                applicationIdSuffix = ".monitoracceptance"
+                versionNameSuffix = "-monitor-acceptance"
+                manifestPlaceholders["appLabel"] = "DroidDesk Monitor Test"
+            }
+        }
         release {
             // Without a release key (contributor builds) fall back to the debug key so the
             // APK still installs; such builds cannot update a published release in place.
@@ -95,4 +107,11 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

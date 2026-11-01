@@ -3,8 +3,14 @@ package com.orailnoor.droiddesk.runtime
 import android.content.Context
 import android.util.Log
 import android.util.Base64
+import android.os.Handler
+import android.os.Looper
 import java.io.File
 import kotlin.concurrent.thread
+import java.util.UUID
+import java.util.concurrent.Executors
+import com.orailnoor.droiddesk.display.DisplayProfile
+import com.orailnoor.droiddesk.display.DisplayProfilePolicy
 
 /**
  * Real chroot-based Linux runtime for rooted Android devices.
@@ -14,7 +20,8 @@ import kotlin.concurrent.thread
  * real chroot. X11 output is sent to the app's embedded LorieView X server
  * through a bind-mounted Unix socket.
  */
-class ChrootRuntime(private val context: Context) {
+class ChrootRuntime(context: Context) {
+    private val context = context.applicationContext
 
     companion object {
         private const val TAG = "ChrootRuntime"
@@ -27,6 +34,8 @@ class ChrootRuntime(private val context: Context) {
         // DesktopActivity starts the chroot while MainActivity owns status and
         // stop controls, so the process handle must be shared app-wide.
         @Volatile private var sessionProcess: Process? = null
+        @Volatile private var sessionEnvironmentFile: String? = null
+        private var displayProfiles: DesktopProfileExecutor? = null
     }
 
     private val rootShell = RootShell(context)
@@ -346,7 +355,7 @@ class ChrootRuntime(private val context: Context) {
      * Start the chrooted desktop session.
      * The caller should ensure the X11 socket directory is mounted before this.
      */
-    fun startSession(desktopEnv: String = "xfce4", width: Int = 1920, height: Int = 1080) {
+    fun startSession(desktopEnv: String = "xfce4", displayProfile: DisplayProfile? = null) {
         if (!hasRoot()) {
             Log.e(TAG, "Cannot start chroot session without root")
             return
@@ -412,6 +421,36 @@ class ChrootRuntime(private val context: Context) {
             "xfce4" -> "startxfce4"
             else -> desktopEnv
         }
+        val sessionId = UUID.randomUUID().toString()
+        val environmentFile = "/tmp/droiddesk-session-$sessionId.env"
+        val wrapperFile = "/tmp/droiddesk-session-$sessionId.sh"
+        val stagedProfile = XfceDisplayProfile.buildStageScript(displayProfile ?: DisplayProfilePolicy.phoneDefaultProfile())
+        val wrapper = """
+            #!/bin/bash
+            set -eu
+            export DISPLAY=:0
+            export XDG_CONFIG_HOME="${'$'}{XDG_CONFIG_HOME:-${'$'}HOME/.config}"
+            if [ -z "${'$'}{XDG_RUNTIME_DIR:-}" ]; then
+                export XDG_RUNTIME_DIR="/tmp/droiddesk-runtime-$sessionId"
+                mkdir -p "${'$'}XDG_RUNTIME_DIR"
+                chmod 700 "${'$'}XDG_RUNTIME_DIR"
+            fi
+            export DROIDDESK_SESSION_ID='$sessionId'
+            export DROIDDESK_SESSION_PID="${'$'}${'$'}"
+            previous_umask=${'$'}(umask)
+            umask 077
+            {
+                printf 'export HOME=%q\n' "${'$'}HOME"
+                printf 'export DISPLAY=%q\n' "${'$'}DISPLAY"
+                printf 'export DBUS_SESSION_BUS_ADDRESS=%q\n' "${'$'}DBUS_SESSION_BUS_ADDRESS"
+                printf 'export XDG_CONFIG_HOME=%q\n' "${'$'}XDG_CONFIG_HOME"
+                printf 'export XDG_RUNTIME_DIR=%q\n' "${'$'}XDG_RUNTIME_DIR"
+                printf 'export DROIDDESK_SESSION_ID=%q\n' "${'$'}DROIDDESK_SESSION_ID"
+                printf 'export DROIDDESK_SESSION_PID=%q\n' "${'$'}DROIDDESK_SESSION_PID"
+            } > '$environmentFile'
+            umask "${'$'}previous_umask"
+            exec ${shellQuote(deBin)}
+        """.trimIndent()
 
         val runScript = """
             # Standard FHS PATH (inherited Android PATH lacks /usr/bin)
@@ -435,12 +474,12 @@ class ChrootRuntime(private val context: Context) {
             # ── Wait for X server to be ready with the correct resolution ──
             # The LorieView X server may still be initializing when the chroot
             # process starts. Poll until the socket exists and xdpyinfo reports
-            # the phone's scaled resolution instead of the 1280x1024 fallback.
+            # a usable geometry. 1280x1024 can be a legitimate measured window.
             echo "DIAG: Waiting for X server on DISPLAY=:0 ..."
             for attempt in ${'$'}(seq 1 50); do
                 if [ -e /tmp/.X11-unix/X0 ]; then
                     current_res=${'$'}(xdpyinfo 2>/dev/null | grep 'dimensions:' | awk '{print ${'$'}2}')
-                    if [ -n "${'$'}current_res" ] && [ "${'$'}current_res" != "1280x1024" ]; then
+                    if [ -n "${'$'}current_res" ]; then
                         echo "DIAG: X server ready at ${'$'}current_res"
                         break
                     fi
@@ -450,50 +489,27 @@ class ChrootRuntime(private val context: Context) {
 
             echo "DIAG: Starting $desktopEnv in chroot on DISPLAY=:0 ..."
 
-            # ── HiDPI configuration for phone screens ──
-            # Set X resources: font DPI and cursor size
-            cat > ~/.Xresources << 'XRES'
-Xft.dpi: 140
-Xft.antialias: 1
-Xft.hinting: 1
-Xft.hintstyle: hintslight
-Xft.rgba: rgb
-Xcursor.size: 32
-XRES
-            xrdb -merge ~/.Xresources 2>/dev/null || true
-            xsetroot -cursor_name left_ptr 2>/dev/null || true
-
-            # Force xrandr to refresh screen geometry so xfwm4 knows the
-            # correct resolution for maximize calculations
-            xrandr --auto 2>/dev/null || true
+            (
+$stagedProfile
+            )
+            if command -v xrdb >/dev/null 2>&1; then
+                if [ -f "${'$'}HOME/.Xresources" ]; then xrdb -merge "${'$'}HOME/.Xresources"; fi
+                xrdb -merge "${'$'}{XDG_CONFIG_HOME:-${'$'}HOME/.config}/droiddesk/display-profile.Xresources"
+            else
+                echo "DIAG: xrdb unavailable; live profile application will report the missing helper"
+            fi
 
             # Disable GTK client-side decorations so all apps use xfwm4's
             # title bar (whose maximize button actually works on Xwayland)
             export GTK_CSD=0
 
-            # Create a wrapper that starts the DE and applies settings after
-            # xfconfd is running on the same D-Bus session
-            DE_BIN="$deBin"
-            cat > /tmp/droiddesk-session.sh << SESSEOF
-#!/bin/bash
-# Apply HiDPI xfconf settings after xfconfd has started
-(
-    sleep 5
-    if command -v xfconf-query >/dev/null 2>&1; then
-        xfconf-query -c xsettings -p /Xft/DPI -s 140 -n -t int 2>/dev/null || true
-        xfconf-query -c xsettings -p /Net/IconThemeName -s Papirus -n -t string 2>/dev/null || true
-        xfconf-query -c xsettings -p /Gtk/FontName -s 'Sans 12' -n -t string 2>/dev/null || true
-        xfconf-query -c xsettings -p /Gtk/CursorThemeSize -s 32 -n -t int 2>/dev/null || true
-    fi
-    # Refresh xrandr again after XFCE panels have loaded
-    xrandr --auto 2>/dev/null || true
-) &
-exec ${'$'}DE_BIN
-SESSEOF
-            chmod +x /tmp/droiddesk-session.sh
+            cat > '$wrapperFile' <<'DROIDDESK_SESSION'
+$wrapper
+DROIDDESK_SESSION
+            chmod +x '$wrapperFile'
 
             # dbus-run-session owns the one session bus for Xfce
-            exec dbus-run-session -- /tmp/droiddesk-session.sh
+            exec dbus-run-session -- '$wrapperFile'
         """.trimIndent()
 
         Log.i(TAG, "Starting chroot session for $desktopEnv")
@@ -505,6 +521,7 @@ SESSEOF
             .redirectErrorStream(true)
             .start()
         sessionProcess = startedSession
+        sessionEnvironmentFile = environmentFile
 
         Thread {
             try {
@@ -649,6 +666,7 @@ SESSEOF
      */
     fun stopSession() {
         Log.i(TAG, "Stopping chroot session...")
+        cancelDisplayProfile()
         sessionProcess?.let {
             try {
                 it.destroyForcibly()
@@ -658,8 +676,61 @@ SESSEOF
             }
         }
         sessionProcess = null
+        val environmentFile = sessionEnvironmentFile
+        sessionEnvironmentFile = null
+        if (environmentFile != null) {
+            val wrapperFile = environmentFile.removeSuffix(".env") + ".sh"
+            val code = rootShell.exec(
+                "chroot ${shellQuote(rootfsDir.absolutePath)} /bin/bash -c " +
+                    shellQuote("rm -f ${shellQuote(environmentFile)} ${shellQuote(wrapperFile)}"),
+            ) { Log.d("DesktopDisplay", it) }
+            if (code != 0) Log.w("DesktopDisplay", "Could not remove retired chroot session metadata")
+        }
         unmountAll()
         Log.i(TAG, "Chroot session stopped")
+    }
+
+    fun applyDisplayProfile(profile: DisplayProfile, onComplete: (Result<Unit>) -> Unit) {
+        try {
+            val runner = captureDesktopRunner()
+            val executor = synchronized(Companion) {
+                displayProfiles ?: DesktopProfileExecutor(
+                    Executors.newSingleThreadExecutor { task -> Thread(task, "ChrootDesktopProfiles") },
+                    { task -> Handler(Looper.getMainLooper()).post(task) },
+                ).also { displayProfiles = it }
+            }
+            val script = XfceDisplayProfile.buildApplyScript(profile)
+            executor.apply({ runner.run(script) }, onComplete)
+        } catch (error: IllegalStateException) {
+            Log.e("DesktopDisplay", "Chroot profile has no live session environment", error)
+            onComplete(Result.failure(error))
+        }
+    }
+
+    fun cancelDisplayProfile() {
+        displayProfiles?.cancel()
+    }
+
+    fun executeDesktopCommand(command: String): Result<Unit> = try {
+        captureDesktopRunner().run(command)
+    } catch (error: IllegalStateException) {
+        Log.e("DesktopDisplay", "Chroot desktop command has no live session", error)
+        Result.failure(error)
+    }
+
+    private fun captureDesktopRunner(): DesktopCommandRunner {
+        val session = checkNotNull(sessionProcess) { "The chroot desktop session is not running" }
+        check(session.isAlive) { "The chroot desktop session ended" }
+        val environmentFile = checkNotNull(sessionEnvironmentFile) { "The chroot desktop bus environment is unavailable" }
+        val su = checkNotNull(rootShell.findSuPath()) { "Root access is unavailable for desktop settings" }
+        return DesktopCommandRunner({ script ->
+            check(sessionProcess === session && session.isAlive) { "The chroot desktop session changed" }
+            val command = getPreloadEnv() +
+                "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; " +
+                "test -r ${shellQuote(environmentFile)} || { echo 'Desktop session environment is missing' >&2; exit 1; }; " +
+                ". ${shellQuote(environmentFile)}; exec /bin/bash -c ${shellQuote(script)}"
+            ProcessBuilder(su, "-c", "chroot ${shellQuote(rootfsDir.absolutePath)} /bin/bash -c ${shellQuote(command)}")
+        }) { Log.e("DesktopDisplay", it) }
     }
 
     // ── Mount handling ──

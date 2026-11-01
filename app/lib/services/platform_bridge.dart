@@ -1,4 +1,6 @@
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
+import 'package:droiddesk/models/desktop_display.dart';
 
 /// Platform channel bridge to communicate with the Kotlin native layer.
 ///
@@ -17,6 +19,8 @@ class DroidDeskPlatform {
   static Function(String text)? onPackageOperationLog;
   static Function(String text)? onTerminalOutput;
   static Function(int downloaded, int total)? onUpdateProgress;
+  static void Function(DesktopDisplayState)? onDesktopDisplayStateChanged;
+  static void Function(FormatException)? onDesktopDisplayError;
 
   static Future<void> updateStatusBarTheme(bool isLightMode) async {
     try {
@@ -28,6 +32,16 @@ class DroidDeskPlatform {
   static void init() {
     _channel.setMethodCallHandler((call) async {
       switch (call.method) {
+        case 'onDesktopDisplayStateChanged':
+          try {
+            onDesktopDisplayStateChanged?.call(
+              DesktopDisplayState.fromMap(desktopDisplayMap(call.arguments)),
+            );
+          } on FormatException catch (error) {
+            debugPrint('Invalid native desktop display state: $error');
+            onDesktopDisplayError?.call(error);
+          }
+          break;
         case 'onDownloadProgress':
           final args = call.arguments as Map;
           onDownloadProgress?.call(
@@ -364,17 +378,46 @@ class DroidDeskPlatform {
 
   // ── Linux Session ──
 
+  static Future<DesktopDisplayState> getDesktopDisplays() async =>
+      DesktopDisplayState.fromMap(
+        desktopDisplayMap(await _channel.invokeMethod<Object?>('getDesktopDisplays')),
+      );
+
+  static Future<DesktopDisplaySettings> getDesktopDisplaySettings(String displayKey) async =>
+      DesktopDisplaySettings.fromMap(
+        desktopDisplayMap(await _channel.invokeMethod<Object?>(
+          'getDesktopDisplaySettings', {'displayKey': displayKey},
+        )),
+      );
+
+  static Future<DesktopDisplayState> saveDesktopDisplaySettings(DesktopDisplaySettings settings) async =>
+      DesktopDisplayState.fromMap(
+        desktopDisplayMap(await _channel.invokeMethod<Object?>(
+          'saveDesktopDisplaySettings', settings.toMap(),
+        )),
+      );
+
+  static Future<DesktopDisplayState> openDesktopOnDisplay({
+    required int displayId,
+    required String displayKey,
+  }) async => DesktopDisplayState.fromMap(
+    desktopDisplayMap(await _channel.invokeMethod<Object?>(
+      'openDesktopOnDisplay', {'displayId': displayId, 'displayKey': displayKey},
+    )),
+  );
+
+  static Future<DesktopDisplayState> moveDesktopToPhone() async =>
+      DesktopDisplayState.fromMap(
+        desktopDisplayMap(await _channel.invokeMethod<Object?>('moveDesktopToPhone')),
+      );
+
   static Future<bool> startLinux({
     String de = 'xfce4',
     String mode = 'x11',
-    int width = 1920,
-    int height = 1080,
   }) async {
     return await _channel.invokeMethod<bool>('startLinux', {
           'de': de,
           'mode': mode,
-          'width': width,
-          'height': height,
         }) ??
         false;
   }

@@ -12,6 +12,11 @@ import android.util.Log
 import java.io.File
 import kotlin.concurrent.thread
 
+private const val LEGACY_LAUNCHER_SOCKET = "droiddesk.android-app-launcher"
+
+internal fun androidLauncherSocketName(packageName: String): String =
+    if (packageName == "com.orailnoor.droiddesk") LEGACY_LAUNCHER_SOCKET else "$LEGACY_LAUNCHER_SOCKET.$packageName"
+
 /**
  * Makes Android launcher apps available to the Linux desktop without granting
  * the Linux processes any extra Android permissions.  XFCE entries connect to
@@ -20,8 +25,6 @@ import kotlin.concurrent.thread
  */
 object AndroidAppBridge {
     private const val TAG = "AndroidAppBridge"
-    private const val SOCKET_NAME = "droiddesk.android-app-launcher"
-
     @Volatile private var server: LocalServerSocket? = null
 
     fun listApps(context: Context): List<Map<String, String>> = launcherActivities(context).map {
@@ -56,7 +59,7 @@ object AndroidAppBridge {
         synchronized(this) {
             if (server != null) return
             try {
-                val socket = LocalServerSocket(SOCKET_NAME)
+                val socket = LocalServerSocket(androidLauncherSocketName(context.packageName))
                 server = socket
                 thread(name = "android-app-bridge", isDaemon = true) {
                     serve(context.applicationContext, socket)
@@ -103,7 +106,7 @@ object AndroidAppBridge {
             if len(sys.argv) != 2:
                 raise SystemExit("Expected an Android package name")
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.connect("\0$SOCKET_NAME")
+            client.connect("\0${androidLauncherSocketName(context.packageName)}")
             client.sendall((sys.argv[1] + "\n").encode())
             """.trimIndent() + "\n",
         )

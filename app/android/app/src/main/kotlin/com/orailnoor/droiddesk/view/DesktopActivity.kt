@@ -30,6 +30,9 @@ import android.widget.TextView
 import android.view.Gravity
 import android.content.Intent
 import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.graphics.Rect
+import android.graphics.Matrix
 import com.orailnoor.droiddesk.R
 import com.orailnoor.droiddesk.service.DroidDeskService
 import com.termux.x11.MainActivity as TermuxMainActivity
@@ -38,17 +41,22 @@ import com.orailnoor.droiddesk.runtime.LinuxRuntime
 import com.orailnoor.droiddesk.runtime.ChrootRuntime
 import com.orailnoor.droiddesk.runtime.ClipboardSync
 import com.orailnoor.droiddesk.runtime.XfceMobileProfile
+import com.orailnoor.droiddesk.runtime.XfceDisplayProfile
 import com.orailnoor.droiddesk.x11.X11ServiceClient
 import com.orailnoor.droiddesk.x11.X11InputController
-import com.orailnoor.droiddesk.runtime.AndroidAppSync
-import java.io.File
-import java.io.BufferedReader
-import java.io.FileReader
+import com.orailnoor.droiddesk.display.DesktopDisplayCoordinator
+import com.orailnoor.droiddesk.display.RendererLease
+import com.orailnoor.droiddesk.display.DisplayProfile
+import com.orailnoor.droiddesk.display.DisplayProfilePolicy
+import com.orailnoor.droiddesk.display.ProfileKind
+import com.orailnoor.droiddesk.display.RenderPolicy
+import com.orailnoor.droiddesk.display.PixelSize
+import com.orailnoor.droiddesk.display.PixelInsets
+import com.orailnoor.droiddesk.display.DesktopDisplayException
 
 class DesktopActivity : Activity() {
     private var lorieView: LorieView? = null
     private var connectionRequested = false
-    private var isSetupDone = false
     private var shouldStartSession = false
     private var sessionMode = "termux"
     private var desktopEnv = "xfce4"
@@ -58,6 +66,29 @@ class DesktopActivity : Activity() {
     private lateinit var placeholder: FrameLayout
     private var x11ServiceClient: X11ServiceClient? = null
     private var inputController: X11InputController? = null
+    private val displayCoordinator = DesktopDisplayCoordinator.shared
+    private var rendererLease: RendererLease? = null
+    private var rendererReleased = false
+    private var displayRequestId = 0L
+    private var sessionEpoch = 0L
+    private var readinessThread: Thread? = null
+    private var currentProfile: DisplayProfile? = null
+    private var desktopReady = false
+    private var appliedUiProfile: DisplayProfile? = null
+    private var applyingUiProfile: DisplayProfile? = null
+    private var failedUiProfile: DisplayProfile? = null
+    private var explicitProfileRetry = false
+    private var profileRevision = 0L
+    private val profileCompletions = mutableListOf<(Result<Unit>) -> Unit>()
+    private var currentInsets = PixelInsets(0, 0, 0, 0)
+    private var lastWindowInsets: WindowInsets? = null
+    private var viewportYScale = 1f
+    private var geometryQueued = false
+    private var geometryListener: View.OnLayoutChangeListener? = null
+    private val geometryUpdate = Runnable {
+        geometryQueued = false
+        applyWindowGeometry()
+    }
     private var inputModeButton: Button? = null
     private var controlOverlay: LinearLayout? = null
     private var collapsedControl: View? = null
@@ -68,7 +99,6 @@ class DesktopActivity : Activity() {
     private var extraKeysBar: ExtraKeysBar? = null
     private var logoAnimator: FloatingLogoAnimator? = null
     private var surfaceCallback: SurfaceHolder.Callback? = null
-    private var intentListenerThread: Thread? = null
     private var loadingOverlay: FrameLayout? = null
     private var loadingStatus: TextView? = null
     private var loadingEstimate: TextView? = null
@@ -125,18 +155,30 @@ class DesktopActivity : Activity() {
 
         /** Closes the desktop screen, e.g. when the session is stopped from the notification. */
         fun finishIfOpen() {
-            current?.get()?.let { activity -> activity.runOnUiThread { activity.finish() } }
+            Handler(Looper.getMainLooper()).post {
+                DesktopDisplayCoordinator.shared.stop()
+                current?.get()?.finish()
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        displayCoordinator.initialize(applicationContext)
+        linuxRuntime = LinuxRuntime(applicationContext)
+        chrootRuntime = ChrootRuntime(applicationContext)
+        displayRequestId = intent.getLongExtra("displayRequestId", 0L)
+        sessionEpoch = intent.getLongExtra("sessionGeneration", 0L)
+        val displayKey = intent.getStringExtra("displayKey")
+        val actualDisplay = windowManager.defaultDisplay.displayId
+        if (displayKey == null || !displayCoordinator.canAttach(displayRequestId, actualDisplay, displayKey, sessionEpoch)) {
+            displayCoordinator.rejectAttachment(displayRequestId)
+            finish()
+            return
+        }
         current = java.lang.ref.WeakReference(this)
-        linuxRuntime = LinuxRuntime(this)
-        chrootRuntime = ChrootRuntime(this)
-        shouldStartSession = intent.getBooleanExtra("startSession", false)
-        sessionMode = intent.getStringExtra("mode") ?: if (chrootRuntime.hasRoot()) "chroot" else "termux"
-        desktopEnv = intent.getStringExtra("de") ?: "xfce4"
+        sessionMode = intent.getStringExtra("mode") ?: displayCoordinator.sessionMode
+        desktopEnv = intent.getStringExtra("de") ?: displayCoordinator.desktopEnv
         estimatedLoadingSeconds = if (shouldStartSession) 30 else 10
 
         requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -151,52 +193,39 @@ class DesktopActivity : Activity() {
         enableImmersiveMode()
 
         Log.i(TAG, "DesktopActivity created mode=$sessionMode startSession=$shouldStartSession")
+        setupLorieView()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enableImmersiveMode()
-        if (hasFocus) startClipboardSync() else clipboardSync?.stop()
-        if (hasFocus && !isSetupDone) {
-            isSetupDone = true
-            Log.i(TAG, "Window focused — setting up LorieView")
-            setupLorieView()
+        if (!hasFocus) {
+            clipboardSync?.stop()
+            return
+        }
+        if (isCurrentRenderer()) {
+            enableImmersiveMode()
+            startClipboardSync()
+            inputController?.reacquireFocus()
         }
     }
 
     override fun onResume() {
         super.onResume()
+        if (displayCoordinator.isStopped) {
+            finish()
+            return
+        }
         enableImmersiveMode()
-        restartSessionIfStopped()
+        scheduleGeometry()
+        // Restored windows can retain focus without another focus callback.
+        if (hasWindowFocus() && isCurrentRenderer()) {
+            startClipboardSync()
+        }
     }
 
-    private fun isSessionRunning(): Boolean =
-        if (sessionMode == "chroot") chrootRuntime.isRunning() else linuxRuntime.isRunning()
-
-    /**
-     * The session can be stopped while this screen stays in the back stack (notification Stop,
-     * in-app Stop). Coming back to it would only show the bare X server, so start Linux again.
-     */
-    private fun restartSessionIfStopped() {
-        if (!desktopRevealed || isSessionRunning()) return
-        Log.i(TAG, "Desktop session is no longer running; starting it again")
-        desktopRevealed = false
-        controlOverlay?.visibility = View.INVISIBLE
-        collapsedControl?.visibility = View.INVISIBLE
-        loadingOverlay?.apply {
-            alpha = 1f
-            visibility = View.VISIBLE
-            bringToFront()
-        }
-        logoAnimator?.start()
-        estimatedLoadingSeconds = 30
-        loadingStartedAt = android.os.SystemClock.elapsedRealtime()
-        loadingMessageHandler.postDelayed(loadingMessageTicker, 5_000)
-        loadingMessageHandler.postDelayed(loadingEstimateTicker, 1_000)
-        // Stop also ended the keep-alive service.
-        startForegroundService(Intent(this, DroidDeskService::class.java))
-        shouldStartSession = true
-        startDesktopSessionIfRequested()
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        scheduleGeometry()
     }
 
     private fun startClipboardSync() {
@@ -248,9 +277,25 @@ class DesktopActivity : Activity() {
 
     private fun setupLorieView() {
         Log.i(TAG, "Setting up LorieView")
-        X11InputController.configureDisplayScale()
-        TermuxMainActivity.getInstance().initLorieView(this)
-        lorieView = TermuxMainActivity.getInstance().lorieView
+        if (displayCoordinator.isStopped) {
+            finish()
+            return
+        }
+        val lease = displayCoordinator.claim(windowManager.defaultDisplay.displayId) {
+            detachRenderer()
+        }
+        rendererLease = lease
+        lorieView = TermuxMainActivity.getInstance().attachLorieView(this, lease.generation)
+        displayCoordinator.registerActivity(
+            lease, displayRequestId,
+            actualDisplay = { lorieView?.display?.displayId ?: windowManager.defaultDisplay.displayId },
+        ) { finishAndRemoveTask() }
+        displayCoordinator.setProfileRefresher(lease) { completion ->
+            failedUiProfile = null
+            explicitProfileRetry = true
+            profileCompletions += completion
+            scheduleGeometry()
+        }
 
         // Keep Android overlay controls above the X11 SurfaceView.
         lorieView!!.setZOrderOnTop(false)
@@ -260,11 +305,18 @@ class DesktopActivity : Activity() {
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
-        // TermuxMainActivity retains its LorieView singleton across activity
-        // recreation. Detach it from the previous activity's container before
-        // attaching it here, otherwise Android throws "child already has a parent".
-        (lorieView!!.parent as? ViewGroup)?.removeView(lorieView)
         placeholder.addView(lorieView, params)
+        geometryListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            scheduleGeometry()
+        }.also { lorieView?.addOnLayoutChangeListener(it) }
+        placeholder.setOnApplyWindowInsetsListener { view, insets ->
+            lastWindowInsets = insets
+            updateExtraKeysBar(insets)
+            scheduleGeometry()
+            view.onApplyWindowInsets(insets)
+        }
+        placeholder.requestApplyInsets()
+        scheduleGeometry()
         loadingOverlay?.bringToFront()
         Log.i(TAG, "LorieView added to placeholder")
 
@@ -275,6 +327,8 @@ class DesktopActivity : Activity() {
             }
 
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                if (!isCurrentRenderer()) return
+                scheduleGeometry()
                 Log.i(TAG, "LorieView surfaceChanged ${width}x${height}")
                 synchronized(this@DesktopActivity) {
                     if (!connectionRequested) {
@@ -294,11 +348,17 @@ class DesktopActivity : Activity() {
         x11ServiceClient = X11ServiceClient(
             context = this,
             onConnected = { serverPid, connectionFd, logcatFd ->
+                if (!isCurrentRenderer()) {
+                    connectionFd.close()
+                    logcatFd?.close()
+                    return@X11ServiceClient
+                }
                 try {
                     if (!LorieView.connected() || X11ServiceClient.connectedServerPid != serverPid) {
                         LorieView.connect(connectionFd.detachFd())
                         logcatFd?.let { LorieView.startLogcat(it.detachFd()) }
                         X11ServiceClient.connectedServerPid = serverPid
+                        lorieView?.onXConnectionChanged()
                         Log.i(TAG, "LorieView connected to X11 service pid=$serverPid")
                     } else {
                         connectionFd.close()
@@ -318,15 +378,195 @@ class DesktopActivity : Activity() {
     }
 
     private fun attachDesktopInput() {
+        val lease = rendererLease ?: return
+        if (!isCurrentRenderer()) return
+        applyWindowGeometry()
         if (inputController == null) {
-            inputController = X11InputController(lorieView!!, onThreeFingerTap = ::toggleKeyboard)
+            val settings = currentProfile?.settings
+                ?: displayCoordinator.loadSettings(currentProfileKind())
+                ?: DisplayProfilePolicy.defaults(currentProfileKind())
+            inputController = X11InputController(
+                lorieView!!, lease.generation, settings.inputMode,
+                onModeChanged = { mode ->
+                    val kind = currentProfileKind()
+                    val saved = displayCoordinator.loadSettings(kind) ?: DisplayProfilePolicy.defaults(kind)
+                    displayCoordinator.saveProfileSettings(kind, saved.copy(inputMode = mode))
+                },
+                onThreeFingerTap = ::toggleKeyboard,
+                onViewportChanged = { _, _, transform ->
+                    val matrix = FloatArray(9)
+                    transform.getValues(matrix)
+                    val scale = kotlin.math.abs(matrix[Matrix.MSCALE_Y])
+                    if (scale > 0f) viewportYScale = 1f / scale
+                    updateOverlayOffsets()
+                    scheduleGeometry()
+                },
+            )
         }
         addDesktopControls()
         lorieView?.requestFocus()
-        if (shouldStartSession) {
-            startDesktopSessionIfRequested()
-        } else {
-            waitForDesktopAndReveal()
+        applyWindowGeometry()
+        waitForDesktopAndReveal()
+    }
+
+    private fun currentProfileKind(): ProfileKind = DisplayProfilePolicy.classify(
+        (lorieView?.display?.displayId ?: windowManager.defaultDisplay.displayId) == android.view.Display.DEFAULT_DISPLAY,
+        resources.configuration.smallestScreenWidthDp,
+        resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK == Configuration.UI_MODE_TYPE_DESK,
+    )
+
+    private fun scheduleGeometry() {
+        if (geometryQueued || !::placeholder.isInitialized || rendererReleased) return
+        geometryQueued = true
+        placeholder.postOnAnimation(geometryUpdate)
+    }
+
+    private fun remainingWindowInsets(view: View): PixelInsets? {
+        if (view.width <= 0 || view.height <= 0) return null
+        val location = IntArray(2)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val insets = lastWindowInsets ?: view.rootWindowInsets ?: return null
+            val raw = insets.getInsets(
+                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout() or WindowInsets.Type.ime(),
+            )
+            val bounds = windowManager.currentWindowMetrics.bounds
+            view.getLocationInWindow(location)
+            return DisplayProfilePolicy.remainingInsets(
+                PixelSize(view.width, view.height), PixelSize(bounds.width(), bounds.height()),
+                location[0], location[1], PixelInsets(raw.left, raw.top, raw.right, raw.bottom),
+            )
+        }
+        val visible = Rect()
+        view.getWindowVisibleDisplayFrame(visible)
+        if (visible.width() <= 0 || visible.height() <= 0) return null
+        view.getLocationOnScreen(location)
+        val clipped = PixelInsets(
+            (visible.left - location[0]).coerceIn(0, view.width),
+            (visible.top - location[1]).coerceIn(0, view.height),
+            (location[0] + view.width - visible.right).coerceIn(0, view.width),
+            (location[1] + view.height - visible.bottom).coerceIn(0, view.height),
+        )
+        val cutout = (lastWindowInsets ?: view.rootWindowInsets)?.displayCutout ?: return clipped
+        val decor = window.decorView
+        if (decor.width <= 0 || decor.height <= 0) return null
+        view.getLocationInWindow(location)
+        val safe = DisplayProfilePolicy.remainingInsets(
+            PixelSize(view.width, view.height), PixelSize(decor.width, decor.height),
+            location[0], location[1],
+            PixelInsets(cutout.safeInsetLeft, cutout.safeInsetTop, cutout.safeInsetRight, cutout.safeInsetBottom),
+        )
+        return PixelInsets(
+            maxOf(clipped.left, safe.left), maxOf(clipped.top, safe.top),
+            maxOf(clipped.right, safe.right), maxOf(clipped.bottom, safe.bottom),
+        )
+    }
+
+    private fun applyWindowGeometry() {
+        if (!isCurrentRenderer()) return
+        val view = lorieView ?: return
+        val lease = rendererLease ?: return
+        val actualDisplay = view.display?.displayId ?: return
+        if (actualDisplay != lease.displayId) {
+            displayCoordinator.onActivityMoved(lease, actualDisplay)
+            return
+        }
+        val remaining = remainingWindowInsets(view) ?: return
+        lastWindowInsets?.let(::updateExtraKeysBar)
+        val keysHeight = extraKeysBar?.takeIf { it.visibility == View.VISIBLE }?.height ?: 0
+        currentInsets = remaining.copy(bottom = remaining.bottom + keysHeight)
+        val content = PixelSize(
+            view.width - currentInsets.left - currentInsets.right,
+            view.height - currentInsets.top - currentInsets.bottom,
+        )
+        if (content.width <= 0 || content.height <= 0) return
+        val kind = currentProfileKind()
+        val profile = DisplayProfilePolicy.resolve(kind, content, displayCoordinator.loadSettings(kind))
+        val render = DisplayProfilePolicy.renderSize(content, profile.settings.renderPolicy) ?: return
+        applyDisplayProfile(profile)
+        view.setDesktopRenderSize(render.width, render.height)
+        view.setContentInsets(currentInsets.left, currentInsets.top, currentInsets.right, currentInsets.bottom)
+        val appliedRender = view.renderedSize ?: return
+        displayCoordinator.reportGeometry(lease, kind, PixelSize(appliedRender.x, appliedRender.y))
+        if (inputController != null && LorieView.connected()) {
+            if (displayCoordinator.consumeSessionStart(lease)) {
+                shouldStartSession = true
+                startDesktopSessionIfRequested()
+            }
+            displayCoordinator.onAttached(lease, displayRequestId, content)
+        }
+        updateOverlayOffsets()
+        val retry = explicitProfileRetry
+        explicitProfileRetry = false
+        applyLiveProfile(force = retry)
+    }
+
+    fun applyDisplayProfile(profile: DisplayProfile) {
+        if (currentProfile == profile) return
+        currentProfile = profile
+        TermuxMainActivity.getPrefs().apply {
+            displayResolutionMode.put(when (profile.settings.renderPolicy) {
+                RenderPolicy.NATIVE -> "native"
+                RenderPolicy.LEGACY_PHONE -> "scaled"
+                else -> "exact"
+            })
+            displayStretch.put(profile.kind == ProfileKind.PHONE && profile.settings.renderPolicy == RenderPolicy.LEGACY_PHONE)
+            scaleTouchpad.put(true)
+        }
+        inputController?.applyProfile(profile)
+        inputModeButton?.let(::showInputMode)
+    }
+
+    private fun applyLiveProfile(force: Boolean = false) {
+        if ((!desktopReady && !force) || !isCurrentRenderer()) return
+        val profile = currentProfile ?: return
+        val lease = rendererLease ?: return
+        if (XfceDisplayProfile.sameUi(failedUiProfile, profile)) {
+            val completions = profileCompletions.toList()
+            profileCompletions.clear()
+            completions.forEach { it(Result.failure(DesktopDisplayException(
+                "PROFILE_APPLY_FAILED", "The profile could not be applied. Retry from display settings.",
+            ))) }
+            return
+        }
+        if (!force && applyingUiProfile == null && XfceDisplayProfile.sameUi(appliedUiProfile, profile)) {
+            val completions = profileCompletions.toList()
+            profileCompletions.clear()
+            completions.forEach { it(Result.success(Unit)) }
+            return
+        }
+        if (XfceDisplayProfile.sameUi(applyingUiProfile, profile)) return
+        applyingUiProfile = profile
+        val revision = ++profileRevision
+        val completion: (Result<Unit>) -> Unit = { outcome ->
+            if (isCurrentRenderer() && profileRevision == revision) {
+                applyingUiProfile = null
+                if (outcome.isSuccess) {
+                    desktopReady = true
+                    appliedUiProfile = profile
+                    failedUiProfile = null
+                } else {
+                    failedUiProfile = profile
+                }
+                displayCoordinator.profileApplied(lease, outcome)
+                val completions = profileCompletions.toList()
+                profileCompletions.clear()
+                completions.forEach { it(outcome) }
+            }
+        }
+        if (sessionMode == "chroot") chrootRuntime.applyDisplayProfile(profile, completion)
+        else linuxRuntime.applyDisplayProfile(profile, completion)
+    }
+
+    private fun updateOverlayOffsets() {
+        val profile = currentProfile ?: return
+        val bottom = currentInsets.bottom + (profile.dockPx * viewportYScale).toInt() +
+            (8 * resources.displayMetrics.density).toInt()
+        for (control in listOfNotNull(controlOverlay, collapsedControl)) {
+            val params = control.layoutParams as? FrameLayout.LayoutParams ?: continue
+            if (params.bottomMargin != bottom) {
+                params.bottomMargin = bottom
+                control.layoutParams = params
+            }
         }
     }
 
@@ -369,9 +609,14 @@ class DesktopActivity : Activity() {
             setPadding((12 * density).toInt(), 0, (14 * density).toInt(), 0)
             showInputMode(this)
             setOnClickListener {
-                inputController?.nextMode()
-                showInputMode(this)
-                Toast.makeText(this@DesktopActivity, "Input mode: $text", Toast.LENGTH_SHORT).show()
+                try {
+                    inputController?.nextMode()
+                    showInputMode(this)
+                    Toast.makeText(this@DesktopActivity, "Input mode: $text", Toast.LENGTH_SHORT).show()
+                } catch (error: IllegalStateException) {
+                    Log.e("DesktopDisplay", "Could not save the input profile", error)
+                    Toast.makeText(this@DesktopActivity, "Could not save input mode. Try again.", Toast.LENGTH_LONG).show()
+                }
             }
         }
         val hideButton = iconButton(R.drawable.ic_dd_close, "Hide desktop controls").apply {
@@ -404,7 +649,7 @@ class DesktopActivity : Activity() {
         }
 
         // Sit just above XFCE's bottom dock, which is scaled up with the X11 display.
-        val dockHeight = XfceMobileProfile.DOCK_SIZE_PX * X11InputController.DISPLAY_SCALE_PERCENT / 100
+        val dockHeight = ((currentProfile?.dockPx ?: XfceMobileProfile.DOCK_SIZE_PX) * viewportYScale).toInt()
         val overlayParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -428,6 +673,7 @@ class DesktopActivity : Activity() {
         collapsedControl?.setOnTouchListener(assistiveTouchListener(collapsedControl!!))
         collapsedControl?.bringToFront()
         addExtraKeysBar()
+        updateOverlayOffsets()
     }
 
     /** Esc/Tab/Ctrl/Alt/arrow row that rides on top of the soft keyboard while it is open. */
@@ -439,6 +685,7 @@ class DesktopActivity : Activity() {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM,
         ))
+        bar.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> scheduleGeometry() }
         // Typing on the soft keyboard releases one-shot Ctrl/Alt (see LorieView's InputConnection).
         TermuxMainActivity.getInstance().apply {
             mExtraKeys = object : TermuxMainActivity.DummyExtraKeys() {
@@ -447,10 +694,6 @@ class DesktopActivity : Activity() {
                 }
             }
             useTermuxEKBarBehaviour = true
-        }
-        placeholder.setOnApplyWindowInsetsListener { view, insets ->
-            updateExtraKeysBar(insets)
-            view.onApplyWindowInsets(insets)
         }
         placeholder.requestApplyInsets()
     }
@@ -464,10 +707,16 @@ class DesktopActivity : Activity() {
             insets.systemWindowInsetBottom
         }
         if (imeBottom > 0) {
-            (bar.layoutParams as FrameLayout.LayoutParams).bottomMargin = imeBottom
-            bar.visibility = View.VISIBLE
-            bar.requestLayout()
-            bar.bringToFront()
+            val params = bar.layoutParams as FrameLayout.LayoutParams
+            val bottom = lorieView?.let(::remainingWindowInsets)?.bottom ?: 0
+            if (params.bottomMargin != bottom) {
+                params.bottomMargin = bottom
+                bar.layoutParams = params
+            }
+            if (bar.visibility != View.VISIBLE) {
+                bar.visibility = View.VISIBLE
+                bar.bringToFront()
+            }
         } else if (bar.visibility == View.VISIBLE) {
             bar.releaseAll()
             bar.visibility = View.GONE
@@ -621,42 +870,90 @@ class DesktopActivity : Activity() {
     private fun startDesktopSessionIfRequested() {
         if (!shouldStartSession) return
         shouldStartSession = false
-        Thread({
+        desktopReady = false
+        appliedUiProfile = null
+        applyingUiProfile = null
+        failedUiProfile = null
+        profileRevision++
+        readinessThread?.interrupt()
+        readinessThread = null
+        if (desktopRevealed) {
+            desktopRevealed = false
+            controlOverlay?.visibility = View.INVISIBLE
+            collapsedControl?.visibility = View.INVISIBLE
+            loadingOverlay?.apply { alpha = 1f; visibility = View.VISIBLE; bringToFront() }
+            logoAnimator?.start()
+            loadingStartedAt = android.os.SystemClock.elapsedRealtime()
+            loadingMessageHandler.postDelayed(loadingMessageTicker, 5_000)
+            loadingMessageHandler.postDelayed(loadingEstimateTicker, 1_000)
+        }
+        val epoch = sessionEpoch
+        val coordinator = displayCoordinator
+        val native = linuxRuntime
+        val rooted = chrootRuntime
+        val mode = sessionMode
+        val desktop = desktopEnv
+        val initialProfile = currentProfile ?: DisplayProfilePolicy.phoneDefaultProfile()
+        val app = applicationContext
+        val activity = java.lang.ref.WeakReference(this)
+        DroidDeskService.executeSession {
+            if (!coordinator.isSessionCurrent(epoch)) return@executeSession
             Log.i(TAG, "Starting Linux desktop session after X server connection")
             try {
-                if (sessionMode == "chroot") {
-                    chrootRuntime.startSession(desktopEnv)
-
-                    // Setup Android App Integration
-                    val rootfsPath = chrootRuntime.getRootfsPath()
-                    chrootRuntime.executeCommand("mkdir -p /tmp && mkfifo /tmp/android_intent_pipe && chmod 666 /tmp/android_intent_pipe") {}
-                    AndroidAppSync.syncApps(this@DesktopActivity, rootfsPath)
-                    startIntentListener(rootfsPath)
+                if (mode == "chroot") {
+                    if (!rooted.isRunning()) rooted.startSession(desktop, initialProfile)
+                    if (coordinator.isSessionCurrent(epoch) && rooted.isRunning()) {
+                        try {
+                            DroidDeskService.ensureLegacyIntentBridge(app, rooted)
+                        } catch (error: Exception) {
+                            Log.e(TAG, "Legacy Android launcher bridge could not start", error)
+                            Handler(Looper.getMainLooper()).post {
+                                if (coordinator.isSessionCurrent(epoch)) coordinator.reportError(DesktopDisplayException(
+                                    "ANDROID_BRIDGE_FAILED", "Linux is running, but the Android launcher bridge failed: ${error.message}",
+                                ))
+                            }
+                        }
+                    }
                 } else {
-                    linuxRuntime.startSession(desktopEnv, "x11")
+                    if (!native.isRunning()) native.startSession(desktop, "x11", initialProfile)
                 }
+                val running = if (mode == "chroot") rooted.isRunning() else native.isRunning()
+                val outcome = if (running) Result.success(Unit) else Result.failure(
+                    IllegalStateException("Linux session did not start; check the setup log"),
+                )
+                Handler(Looper.getMainLooper()).post {
+                    coordinator.sessionStarted(epoch, outcome)
+                    activity.get()?.takeIf { it.isCurrentRenderer() }?.waitForDesktopAndReveal()
+                }
+            } catch (error: Exception) {
+                Log.e(TAG, "Desktop session failed", error)
+                Handler(Looper.getMainLooper()).post {
+                    coordinator.sessionStarted(epoch, Result.failure(error))
+                    activity.get()?.takeIf { it.isCurrentRenderer() }?.revealDesktop(false)
+                }
+            }
+        }
+    }
+
+    private fun waitForDesktopAndReveal() {
+        if (readinessThread != null) return
+        readinessThread = Thread({
+            try {
                 val ready = if (sessionMode == "chroot") {
                     chrootRuntime.waitForDesktopReady(desktopEnv)
                 } else {
                     linuxRuntime.waitForDesktopReady(desktopEnv)
                 }
                 revealDesktop(ready)
-            } catch (error: Throwable) {
-                Log.e(TAG, "Desktop session failed", error)
-                revealDesktop(false)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                val finished = Thread.currentThread()
+                Handler(Looper.getMainLooper()).post {
+                    if (readinessThread === finished) readinessThread = null
+                }
             }
-        }, "LinuxDesktopSession").start()
-    }
-
-    private fun waitForDesktopAndReveal() {
-        Thread({
-            val ready = if (sessionMode == "chroot") {
-                chrootRuntime.waitForDesktopReady(desktopEnv)
-            } else {
-                linuxRuntime.waitForDesktopReady(desktopEnv)
-            }
-            revealDesktop(ready)
-        }, "LinuxDesktopReady").start()
+        }, "LinuxDesktopReady").also { it.start() }
     }
 
     /** Follows the theme picked in the app (Flutter stores it as flutter.theme_mode). */
@@ -764,24 +1061,45 @@ class DesktopActivity : Activity() {
 
     private fun revealDesktop(ready: Boolean) {
         runOnUiThread {
-            if (desktopRevealed || isFinishing || isDestroyed) return@runOnUiThread
-            desktopRevealed = true
-            loadingMessageHandler.removeCallbacks(loadingMessageTicker)
-            loadingMessageHandler.removeCallbacks(loadingEstimateTicker)
-            if (!ready) Log.w(TAG, "Revealing desktop after readiness timeout")
-            Log.i(TAG, "Desktop revealed ready=$ready")
-            loadingOverlay?.animate()
-                ?.alpha(0f)
-                ?.setDuration(350)
-                ?.withEndAction {
+            if (!isCurrentRenderer() || isFinishing || isDestroyed) return@runOnUiThread
+            desktopReady = ready
+            if (!ready) {
+                val outcome = Result.failure<Unit>(IllegalStateException(
+                    "Desktop services are not ready. Check the session log and retry the display profile.",
+                ))
+                rendererLease?.let { displayCoordinator.profileApplied(it, outcome) }
+                val completions = profileCompletions.toList()
+                profileCompletions.clear()
+                completions.forEach { it(outcome) }
+                finishReveal()
+            } else {
+                failedUiProfile = null
+                if (!desktopRevealed) profileCompletions += { if (isCurrentRenderer()) finishReveal() }
+                applyWindowGeometry()
+                applyLiveProfile()
+            }
+        }
+    }
+
+    private fun finishReveal() {
+        if (!isCurrentRenderer() || desktopRevealed || isFinishing || isDestroyed) return
+        desktopRevealed = true
+        loadingMessageHandler.removeCallbacks(loadingMessageTicker)
+        loadingMessageHandler.removeCallbacks(loadingEstimateTicker)
+        Log.i(TAG, "Desktop revealed ready=$desktopReady")
+        loadingOverlay?.animate()
+            ?.alpha(0f)
+            ?.setDuration(350)
+            ?.withEndAction {
+                if (isCurrentRenderer()) {
                     loadingOverlay?.visibility = View.GONE
                     logoAnimator?.stop()
                     collapsedControl?.visibility = View.VISIBLE
                     collapsedControl?.bringToFront()
                     lorieView?.requestFocus()
                 }
-                ?.start()
-        }
+            }
+            ?.start()
     }
 
     private fun showX11Error(message: String, error: Throwable?) {
@@ -789,55 +1107,42 @@ class DesktopActivity : Activity() {
         Toast.makeText(this, "X11 Error: $message", Toast.LENGTH_LONG).show()
     }
 
-    private fun startIntentListener(rootfsPath: String) {
-        if (intentListenerThread != null) return
-        intentListenerThread = Thread({
-            val pipePath = "$rootfsPath/tmp/android_intent_pipe"
-            while (!Thread.currentThread().isInterrupted) {
-                try {
-                    val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "tail -f $pipePath"))
-                    BufferedReader(java.io.InputStreamReader(process.inputStream)).use { reader ->
-                        while (!Thread.currentThread().isInterrupted) {
-                            val packageName = reader.readLine() ?: break
-                            if (packageName.isNotBlank()) {
-                                launchAndroidApp(packageName.trim())
-                            }
-                        }
-                    }
-                    process.destroy()
-                } catch (e: InterruptedException) {
-                    break
-                } catch (e: Exception) {
-                    Thread.sleep(1000)
-                }
-            }
-        }, "AndroidIntentListener")
-        intentListenerThread?.start()
-    }
+    private fun isCurrentRenderer(): Boolean = rendererLease?.let {
+        displayCoordinator.isCurrent(it) && TermuxMainActivity.getInstance().isLorieViewOwner(it.generation)
+    } == true
 
-    private fun launchAndroidApp(packageName: String) {
-        try {
-            val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-            if (launchIntent != null) {
-                Log.i(TAG, "Launching Android App: ${packageName}")
-                startActivity(launchIntent)
-            } else {
-                Log.w(TAG, "No launch intent found for package: $packageName")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch app $packageName", e)
+    private fun detachRenderer() {
+        if (rendererReleased) return
+        rendererReleased = true
+        profileRevision++
+        desktopReady = false
+        val ownedLease = rendererLease
+        if (ownedLease != null && TermuxMainActivity.getInstance().isLorieViewOwner(ownedLease.generation)) {
+            if (sessionMode == "chroot") chrootRuntime.cancelDisplayProfile() else linuxRuntime.cancelDisplayProfile()
         }
-    }
-
-    override fun onDestroy() {
+        val pendingProfiles = profileCompletions.toList()
+        profileCompletions.clear()
+        val cancelled = Result.failure<Unit>(DesktopDisplayException(
+            if (displayCoordinator.isStopped) "SESSION_STOPPED" else "PROFILE_APPLY_FAILED",
+            "Settings were saved but the view closed before profile application was confirmed",
+        ))
+        pendingProfiles.forEach { it(cancelled) }
+        if (::placeholder.isInitialized) placeholder.removeCallbacks(geometryUpdate)
+        geometryQueued = false
+        geometryListener?.let { lorieView?.removeOnLayoutChangeListener(it) }
+        geometryListener = null
+        if (::placeholder.isInitialized) placeholder.setOnApplyWindowInsetsListener(null)
         collapsedFadeHandler.removeCallbacks(fadeCollapsedControl)
         clipboardSync?.stop()
         clipboardSync = null
         extraKeysBar?.releaseAll()
         extraKeysBar = null
+        val lease = rendererLease
         TermuxMainActivity.getInstance().apply {
-            mExtraKeys = null
-            useTermuxEKBarBehaviour = false
+            if (lease != null && isLorieViewOwner(lease.generation)) {
+                mExtraKeys = null
+                useTermuxEKBarBehaviour = false
+            }
         }
         loadingMessageHandler.removeCallbacks(loadingMessageTicker)
         loadingMessageHandler.removeCallbacks(loadingEstimateTicker)
@@ -845,10 +1150,19 @@ class DesktopActivity : Activity() {
         surfaceCallback = null
         inputController?.dispose()
         inputController = null
+        lease?.let { TermuxMainActivity.getInstance().releaseLorieView(it.generation) }
+        (lorieView?.parent as? ViewGroup)?.removeView(lorieView)
+        lorieView = null
         x11ServiceClient?.disconnect()
         x11ServiceClient = null
-        intentListenerThread?.interrupt()
-        intentListenerThread = null
+        readinessThread?.interrupt()
+        readinessThread = null
+        logoAnimator?.stop()
+    }
+
+    override fun onDestroy() {
+        rendererLease?.let(displayCoordinator::release)
+        detachRenderer()
         if (current?.get() === this) current = null
         super.onDestroy()
     }

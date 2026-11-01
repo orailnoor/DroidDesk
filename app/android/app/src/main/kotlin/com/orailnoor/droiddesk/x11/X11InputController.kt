@@ -2,33 +2,60 @@ package com.orailnoor.droiddesk.x11
 
 import android.view.MotionEvent
 import android.view.View
+import android.graphics.Matrix
 import com.termux.x11.LorieView
 import com.termux.x11.MainActivity
 import com.termux.x11.input.InputEventSender
 import com.termux.x11.input.TouchInputHandler
+import com.termux.x11.input.InputStub
+import com.orailnoor.droiddesk.display.DisplayProfile
 
 /** Connects LorieView to the gesture/input implementation imported from Termux:X11. */
 class X11InputController(
     private val lorieView: LorieView,
+    private val generation: Long,
+    initialMode: Int,
+    private val onModeChanged: (Int) -> Unit,
     onThreeFingerTap: () -> Unit = {},
+    private val onViewportChanged: (Int, Int, Matrix) -> Unit = { _, _, _ -> },
 ) {
-    private val inputHandler = TouchInputHandler(
-        MainActivity.getInstance(),
-        InputEventSender(lorieView),
-    )
+    private fun isCurrent() = MainActivity.getInstance().isLorieViewOwner(generation)
+    private val sender = InputEventSender(object : InputStub {
+        override fun sendMouseEvent(x: Float, y: Float, button: Int, down: Boolean, relative: Boolean) {
+            if (isCurrent()) lorieView.sendMouseEvent(x, y, button, down, relative)
+        }
+        override fun sendMouseWheelEvent(x: Float, y: Float) {
+            if (isCurrent()) lorieView.sendMouseWheelEvent(x, y)
+        }
+        override fun sendKeyEvent(scan: Int, key: Int, down: Boolean) =
+            isCurrent() && lorieView.sendKeyEvent(scan, key, down)
+        override fun sendTextEvent(text: ByteArray) {
+            if (isCurrent()) lorieView.sendTextEvent(text)
+        }
+        override fun sendTouchEvent(action: Int, pointer: Int, x: Int, y: Int) {
+            if (isCurrent()) lorieView.sendTouchEvent(action, pointer, x, y)
+        }
+        override fun sendStylusEvent(
+            x: Float, y: Float, pressure: Int, tiltX: Int, tiltY: Int, orientation: Int,
+            buttons: Int, eraser: Boolean, mouseMode: Boolean,
+        ) {
+            if (isCurrent()) lorieView.sendStylusEvent(x, y, pressure, tiltX, tiltY, orientation, buttons, eraser, mouseMode)
+        }
+    })
+    private val inputHandler = TouchInputHandler(MainActivity.getInstance(), sender)
 
-    /** Input mode the user picked last time; survives app restarts. */
-    private val savedModes = lorieView.context.getSharedPreferences("desktop_input", android.content.Context.MODE_PRIVATE)
-
-    var mode: Int = savedModes.getInt(KEY_MODE, TouchInputHandler.InputMode.TRACKPAD)
+    var mode: Int = initialMode
         private set
 
     init {
         setMode(mode)
-        MainActivity.getInstance().setKeyHandler(inputHandler::sendKeyEvent)
-        TouchInputHandler.setThreeFingerTapListener { onThreeFingerTap() }
+        MainActivity.getInstance().setKeyHandler(inputHandler::sendKeyEvent, generation)
+        TouchInputHandler.setThreeFingerTapListener { if (isCurrent()) onThreeFingerTap() }
         lorieView.setCallback { width, height, transform ->
-            inputHandler.handleInputTransformChanged(width, height, transform)
+            if (isCurrent()) {
+                inputHandler.handleInputTransformChanged(width, height, transform)
+                onViewportChanged(width, height, transform)
+            }
         }
         lorieView.setOnTouchListener(::handleMotionEvent)
         lorieView.setOnGenericMotionListener(::handleMotionEvent)
@@ -40,6 +67,7 @@ class X11InputController(
             TouchInputHandler.InputMode.SIMULATED_TOUCH -> TouchInputHandler.InputMode.TOUCH
             else -> TouchInputHandler.InputMode.TRACKPAD
         }
+        onModeChanged(next)
         setMode(next)
         return next
     }
@@ -51,26 +79,43 @@ class X11InputController(
     }
 
     fun dispose() {
-        MainActivity.getInstance().setKeyHandler(null)
-        TouchInputHandler.setThreeFingerTapListener(null)
+        if (isCurrent()) {
+            if (LorieView.connected()) sender.releaseAll()
+            MainActivity.getInstance().setKeyHandler(null, generation)
+            TouchInputHandler.setThreeFingerTapListener(null)
+        }
+        inputHandler.dispose()
         lorieView.setOnTouchListener(null)
         lorieView.setOnGenericMotionListener(null)
         lorieView.setCallback(null)
     }
 
     private fun setMode(newMode: Int) {
+        require(newMode in 1..3)
         mode = newMode
-        savedModes.edit().putInt(KEY_MODE, newMode).apply()
         val prefs = MainActivity.getPrefs()
         prefs.touchMode.put(newMode.toString())
         inputHandler.reloadPreferences(prefs)
     }
 
+    fun applyProfile(profile: DisplayProfile) {
+        if (isCurrent()) setMode(profile.settings.inputMode)
+    }
+
     private fun handleMotionEvent(view: View, event: MotionEvent): Boolean =
-        inputHandler.handleTouchEvent(lorieView, view, event)
+        isCurrent() && inputHandler.handleTouchEvent(lorieView, view, event)
+
+    fun reacquireFocus() {
+        if (!isCurrent()) return
+        lorieView.requestFocus()
+        inputHandler.reloadPreferences(MainActivity.getPrefs())
+        if (MainActivity.getPrefs().pointerCapture.get() && !lorieView.hasPointerCapture()) {
+            lorieView.requestPointerCapture()
+        }
+        lorieView.refreshRenderer()
+    }
 
     companion object {
-        private const val KEY_MODE = "mode"
         const val DISPLAY_SCALE_PERCENT = 150
 
         /** Must run before LorieView is measured so Xwayland starts at the scaled resolution. */

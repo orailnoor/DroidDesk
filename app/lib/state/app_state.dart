@@ -1,11 +1,120 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'dart:async';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:droiddesk/services/platform_bridge.dart';
 import 'package:droiddesk/services/update_service.dart';
 import 'package:droiddesk/theme/droid_theme.dart';
+import 'package:droiddesk/models/desktop_display.dart';
 
 /// Central state management for the entire DroidDesk app.
 class AppState extends ChangeNotifier {
+  bool _disposed = false;
+  DesktopDisplayState _desktopDisplays = DesktopDisplayState();
+  bool _desktopOperationBusy = false;
+  String? _desktopOperationError;
+  int _desktopEventRevision = 0;
+
+  DesktopDisplayState get desktopDisplays => _desktopDisplays;
+  bool get desktopDisplayBusy => _desktopOperationBusy || _desktopDisplays.isMoving;
+  String? get desktopOperationError => _desktopOperationError;
+  String? get desktopDisplayError =>
+      _desktopOperationError ?? _desktopDisplays.error?.toString();
+
+  void _attachDisplayCallbacks() {
+    if (_disposed) return;
+    DroidDeskPlatform.onDesktopDisplayStateChanged = _receiveDesktopDisplays;
+    DroidDeskPlatform.onDesktopDisplayError = _receiveDesktopDisplayError;
+  }
+
+  void _receiveDesktopDisplays(DesktopDisplayState state) {
+    if (_disposed) return;
+    _desktopEventRevision++;
+    _desktopDisplays = state;
+    notifyListeners();
+    if (state.phase == DesktopDisplayPhase.stopped ||
+        state.error?.code == 'SESSION_STOPPED') {
+      unawaited(refreshStatus());
+    }
+  }
+
+  void _receiveDesktopDisplayError(FormatException error) {
+    if (_disposed) return;
+    _recordDisplayError(error);
+    unawaited(refreshDesktopDisplays());
+  }
+
+  void _recordDisplayError(Object error) {
+    if (_disposed) return;
+    _desktopOperationError = error is PlatformException
+        ? '${error.code}: ${error.message ?? 'Desktop display operation failed'}'
+        : error.toString();
+    debugPrint('Desktop display operation failed: $error');
+    notifyListeners();
+  }
+
+  void clearDesktopDisplayError() {
+    if (_disposed) return;
+    _desktopOperationError = null;
+    notifyListeners();
+  }
+
+  Future<void> refreshDesktopDisplays() async {
+    if (_disposed) return;
+    _attachDisplayCallbacks();
+    final revision = _desktopEventRevision;
+    try {
+      final state = await DroidDeskPlatform.getDesktopDisplays();
+      if (_disposed || revision != _desktopEventRevision) return;
+      _desktopDisplays = state;
+      notifyListeners();
+    } on PlatformException catch (error) {
+      _recordDisplayError(error);
+    } on FormatException catch (error) {
+      _recordDisplayError(error);
+    }
+  }
+
+  Future<DesktopDisplaySettings> getDesktopDisplaySettings(String key) =>
+      DroidDeskPlatform.getDesktopDisplaySettings(key);
+
+  Future<void> openDesktopOnDisplay(DesktopDisplayInfo display) =>
+      _runDesktopOperation(() => DroidDeskPlatform.openDesktopOnDisplay(
+        displayId: display.id, displayKey: display.key,
+      ));
+
+  Future<void> moveDesktopToPhone() =>
+      _runDesktopOperation(DroidDeskPlatform.moveDesktopToPhone);
+
+  Future<void> saveDesktopDisplaySettings(DesktopDisplaySettings settings) =>
+      _runDesktopOperation(() => DroidDeskPlatform.saveDesktopDisplaySettings(settings));
+
+  Future<void> _runDesktopOperation(Future<DesktopDisplayState> Function() operation) async {
+    if (_disposed) return;
+    if (desktopDisplayBusy) {
+      _recordDisplayError(StateError('Another desktop display action is in progress'));
+      return;
+    }
+    _desktopOperationBusy = true;
+    _desktopOperationError = null;
+    notifyListeners();
+    final revision = _desktopEventRevision;
+    try {
+      final state = await operation();
+      if (!_disposed && revision == _desktopEventRevision) _desktopDisplays = state;
+    } on PlatformException catch (error) {
+      _recordDisplayError(error);
+    } on FormatException catch (error) {
+      _recordDisplayError(error);
+    } finally {
+      if (!_disposed) {
+        _desktopOperationBusy = false;
+        notifyListeners();
+        await refreshDesktopDisplays();
+      }
+    }
+  }
+
   // ── Theme State ──
   ThemeMode _themeMode = ThemeMode.dark;
 
@@ -104,11 +213,13 @@ class AppState extends ChangeNotifier {
   AppLifecycleListener? _lifecycleListener;
 
   Future<void> initialize() async {
+    _attachDisplayCallbacks();
     DroidDeskPlatform.onPackageOperationProgress = _onPackageProgress;
     DroidDeskPlatform.onPackageOperationLog = _onPackageLog;
     _lifecycleListener ??= AppLifecycleListener(
       onResume: () {
         refreshStatus();
+        refreshDesktopDisplays();
         checkForUpdate();
       },
     );
@@ -195,20 +306,25 @@ class AppState extends ChangeNotifier {
 
     await refreshStatus();
     await loadDeviceInfo();
+    await refreshDesktopDisplays();
     DroidDeskPlatform.onUpdateProgress = _onUpdateProgress;
     checkForUpdate();
 
     final prefs = await SharedPreferences.getInstance();
     _autoStartDesktop = prefs.getBool('autoStartDesktop') ?? false;
 
-    if (_autoStartDesktop && isSetupComplete && !_isRunning) {
-      // Auto-start desktop when the app (launcher) boots up
-      startLinux(mode: 'x11');
-    }
+    // Android admits auto-start on a fresh app launch; rebuilding Dart must not restart Stop.
   }
 
   @override
   void dispose() {
+    _disposed = true;
+    if (DroidDeskPlatform.onDesktopDisplayStateChanged == _receiveDesktopDisplays) {
+      DroidDeskPlatform.onDesktopDisplayStateChanged = null;
+    }
+    if (DroidDeskPlatform.onDesktopDisplayError == _receiveDesktopDisplayError) {
+      DroidDeskPlatform.onDesktopDisplayError = null;
+    }
     _lifecycleListener?.dispose();
     super.dispose();
   }
@@ -256,6 +372,7 @@ class AppState extends ChangeNotifier {
   Future<void> refreshStatus() async {
     try {
       final status = await DroidDeskPlatform.getRuntimeStatus();
+      if (_disposed) return;
       _isBootstrapped = status['isBootstrapped'] == true;
       _isRunning = status['isRunning'] == true;
       _hasRoot = status['hasRoot'] == true;
@@ -265,9 +382,10 @@ class AppState extends ChangeNotifier {
       if (_installedDE.isNotEmpty) {
         await refreshOptionalApps();
       }
-
+      if (_disposed) return;
       notifyListeners();
     } catch (e) {
+      if (_disposed) return;
       _errorMessage = 'Failed to get runtime status: $e';
       notifyListeners();
     }
@@ -441,7 +559,9 @@ class AppState extends ChangeNotifier {
 
   Future<void> refreshOptionalApps() async {
     try {
-      _optionalApps = await DroidDeskPlatform.getOptionalApps();
+      final apps = await DroidDeskPlatform.getOptionalApps();
+      if (_disposed) return;
+      _optionalApps = apps;
       notifyListeners();
     } catch (_) {
       // The desktop remains usable even if package status cannot be queried.
@@ -746,16 +866,12 @@ class AppState extends ChangeNotifier {
 
   Future<void> startLinux({
     String mode = 'x11',
-    int width = 1920,
-    int height = 1080,
   }) async {
     try {
       _errorMessage = null;
       final started = await DroidDeskPlatform.startLinux(
         de: _selectedDE,
         mode: mode,
-        width: width,
-        height: height,
       );
       if (!started) {
         throw StateError('Linux runtime is not ready');
