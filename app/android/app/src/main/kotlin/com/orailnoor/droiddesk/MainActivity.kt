@@ -23,6 +23,11 @@ import com.orailnoor.droiddesk.x11.X11ServerService
 import kotlin.concurrent.thread
 import android.util.Log
 import android.widget.Toast
+import com.orailnoor.droiddesk.display.DesktopDisplayCoordinator
+import com.orailnoor.droiddesk.display.DesktopDisplayException
+import com.orailnoor.droiddesk.display.DesktopLaunchReply
+import com.orailnoor.droiddesk.display.DisplaySettings
+import com.orailnoor.droiddesk.display.RenderPolicy
 
 class MainActivity : FlutterActivity() {
 
@@ -31,6 +36,7 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "MainActivity"
         /** Sent by the "Open" notification action: show the desktop, resuming a running session. */
         const val ACTION_OPEN_DESKTOP = "com.orailnoor.droiddesk.action.OPEN_DESKTOP"
+        const val ACTION_RETURN_TO_PHONE = "com.orailnoor.droiddesk.action.RETURN_TO_PHONE"
         private val packageOperationRunning = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 
@@ -40,6 +46,7 @@ class MainActivity : FlutterActivity() {
     private lateinit var linuxRuntime: LinuxRuntime
     private lateinit var chrootRuntime: ChrootRuntime
     private lateinit var desktopIntegration: DesktopIntegration
+    private var displayStateSubscription: (() -> Unit)? = null
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val logBuffer = StringBuffer()
@@ -79,32 +86,33 @@ class MainActivity : FlutterActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false)
         }
-        linuxRuntime = LinuxRuntime(this)
-        chrootRuntime = ChrootRuntime(this)
+        linuxRuntime = LinuxRuntime(applicationContext)
+        chrootRuntime = ChrootRuntime(applicationContext)
         desktopIntegration = DesktopIntegration(this)
 
         if (intent.getBooleanExtra("autoSetup", false)) {
             runAutoChrootSetup()
         }
         handleHomeLaunch(intent)
-        maybeAutoStartDesktop(intent)
+        if (savedInstanceState == null && !intent.getBooleanExtra("autoSetup", false)) maybeAutoStartDesktop(intent)
     }
 
     /** Optional "Auto-Start Linux Desktop" setting: open the chroot desktop whenever the app starts. */
     private fun maybeAutoStartDesktop(launchIntent: Intent) {
         // Home presses and the notification's Open action already launch the desktop.
         val isHomeLaunch = launchIntent.action == Intent.ACTION_MAIN && launchIntent.hasCategory(Intent.CATEGORY_HOME)
-        if (isHomeLaunch || launchIntent.action == ACTION_OPEN_DESKTOP) return
+        if (isHomeLaunch || launchIntent.action == ACTION_OPEN_DESKTOP || launchIntent.action == ACTION_RETURN_TO_PHONE) return
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
         val autoStart = prefs.getBoolean("flutter.autoStartDesktop", false)
-        if (autoStart && chrootRuntime.hasRoot() && chrootRuntime.isRootfsReady()) {
-            startForegroundService()
-            val desktopIntent = Intent(this, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-                putExtra("startSession", !chrootRuntime.isRunning())
-                putExtra("mode", "chroot")
-                putExtra("de", "xfce4")
-            }
-            startActivity(desktopIntent)
+        if (autoStart) {
+            val rooted = chrootRuntime.hasRoot()
+            val desktop = if (rooted) "xfce4" else linuxRuntime.getInstalledDE()
+            val ready = if (rooted) chrootRuntime.isRootfsReady() && chrootRuntime.isDesktopInstalled()
+                else linuxRuntime.isBootstrapped() && desktop.isNotEmpty()
+            if (ready) requestDesktop(
+                if (rooted) "chroot" else "termux", desktop,
+                !(if (rooted) chrootRuntime.isRunning() else linuxRuntime.isRunning()),
+            )
         }
     }
 
@@ -158,14 +166,20 @@ class MainActivity : FlutterActivity() {
 
     private fun handleHomeLaunch(homeIntent: Intent) {
         val isHomeLaunch = homeIntent.action == Intent.ACTION_MAIN && homeIntent.hasCategory(Intent.CATEGORY_HOME)
-        if (!isHomeLaunch && homeIntent.action != ACTION_OPEN_DESKTOP) return
-        if (homeIntent.action == ACTION_OPEN_DESKTOP && com.orailnoor.droiddesk.view.DesktopActivity.isOpen()) {
-            // Reuse the existing desktop screen; a second one would fight over the shared LorieView.
-            startActivity(
-                Intent(this, com.orailnoor.droiddesk.view.DesktopActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
-            )
-            if (!isTaskRoot) finish()
+        if (!isHomeLaunch && homeIntent.action != ACTION_OPEN_DESKTOP && homeIntent.action != ACTION_RETURN_TO_PHONE) return
+        val coordinator = DesktopDisplayCoordinator.shared
+        if (homeIntent.action == ACTION_RETURN_TO_PHONE) {
+            coordinator.moveToPhone { outcome -> outcome.exceptionOrNull()?.let { displayFailure(it) } }
+            return
+        }
+        if (chrootRuntime.isRunning() || linuxRuntime.isRunning() || coordinator.isStarting) {
+            coordinator.openActive { outcome -> outcome.exceptionOrNull()?.let { displayFailure(it) } }
+            return
+        }
+        val epoch = try {
+            coordinator.beginSession()
+        } catch (error: DesktopDisplayException) {
+            displayFailure(error)
             return
         }
 
@@ -182,14 +196,9 @@ class MainActivity : FlutterActivity() {
                 return@thread
             }
 
-            startForegroundService()
             val sessionRunning = if (rooted) chrootRuntime.isRunning() else linuxRuntime.isRunning()
             runOnUiThread {
-                startActivity(Intent(this, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-                    putExtra("startSession", !sessionRunning)
-                    putExtra("mode", if (rooted) "chroot" else "termux")
-                    putExtra("de", desktopEnv)
-                })
+                requestDesktop(if (rooted) "chroot" else "termux", desktopEnv, !sessionRunning, expectedEpoch = epoch)
             }
         }
     }
@@ -199,6 +208,12 @@ class MainActivity : FlutterActivity() {
      * the chroot desktop without any Flutter UI interaction.
      */
     private fun runAutoChrootSetup() {
+        val epoch = try {
+            DesktopDisplayCoordinator.shared.beginSession()
+        } catch (error: DesktopDisplayException) {
+            displayFailure(error)
+            return
+        }
         thread(name = "auto-chroot-setup") {
             try {
                 Log.i(TAG, "Auto-setup: checking root...")
@@ -257,12 +272,7 @@ class MainActivity : FlutterActivity() {
 
                 Log.i(TAG, "Auto-setup: launching desktop...")
                 runOnUiThread {
-                    val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-                        putExtra("startSession", !chrootRuntime.isRunning())
-                        putExtra("mode", "chroot")
-                        putExtra("de", "xfce4")
-                    }
-                    startActivity(intent)
+                    requestDesktop("chroot", "xfce4", !chrootRuntime.isRunning(), expectedEpoch = epoch)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Auto-setup failed", e)
@@ -275,6 +285,13 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        val displays = DesktopDisplayCoordinator.shared
+        displays.initialize(applicationContext)
+        displayStateSubscription?.invoke()
+        val displayChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        displayStateSubscription = displays.subscribe { state ->
+            displayChannel.invokeMethod("onDesktopDisplayStateChanged", state)
+        }
 
         flutterEngine
             .platformViewsController
@@ -283,6 +300,70 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
+                "getDesktopDisplays" -> result.success(displays.snapshot())
+                "setAutoOpenOnMonitor" -> {
+                    val enabled = (call.arguments as? Map<*, *>)?.get("enabled") as? Boolean
+                    if (enabled == null) {
+                        Log.w("DesktopDisplay", "Automatic monitor opening requires a Boolean enabled value")
+                        result.error("INVALID_ARGUMENT", "enabled must be a Boolean", null)
+                    } else {
+                        try {
+                            displays.setAutoOpenOnMonitor(enabled)
+                            result.success(displays.snapshot())
+                        } catch (error: IllegalStateException) {
+                            Log.e("DesktopDisplay", "Could not persist automatic monitor opening", error)
+                            result.error("DISPLAY_SETTINGS_SAVE_FAILED", error.message, null)
+                        }
+                    }
+                }
+                "saveDesktopDisplaySettings" -> {
+                    val reply = DesktopLaunchReply(result, displays)
+                    try {
+                        val arguments = call.arguments as? Map<*, *> ?: throw IllegalArgumentException("Settings are required")
+                        val key = arguments["displayKey"] as? String
+                        val policy = RenderPolicy.fromWire(arguments["renderPolicy"] as? String)
+                        val rawScale = arguments["uiScalePercent"]
+                        val mode = arguments["inputMode"] as? Int
+                        require(!key.isNullOrEmpty() && policy != null && mode != null) { "Invalid display settings" }
+                        require(arguments.containsKey("uiScalePercent") && (rawScale == null || rawScale is Int)) {
+                            "uiScalePercent must be an integer or Automatic"
+                        }
+                        val settings = DisplaySettings(policy, rawScale as? Int, mode)
+                        displays.saveSettingsFor(key, settings) { replyDisplayState(reply, it) }
+                    } catch (error: DesktopDisplayException) {
+                        displayFailure(error, reply)
+                    } catch (error: IllegalArgumentException) {
+                        Log.w("DesktopDisplay", "Invalid settings payload", error)
+                        reply.error("INVALID_ARGUMENT", error.message, null)
+                    } catch (error: IllegalStateException) {
+                        Log.e("DesktopDisplay", "Could not persist display settings", error)
+                        reply.error("PROFILE_APPLY_FAILED", error.message, null)
+                    }
+                }
+                "openDesktopOnDisplay" -> {
+                    val arguments = call.arguments as? Map<*, *>
+                    val id = arguments?.get("displayId") as? Int
+                    val key = arguments?.get("displayKey") as? String
+                    if (id == null || id < 0 || key.isNullOrEmpty()) {
+                        Log.w("DesktopDisplay", "Invalid display launch arguments")
+                        result.error("INVALID_ARGUMENT", "displayId and displayKey are required", null)
+                    } else {
+                        displays.open(id, key) { replyDisplayState(result, it) }
+                    }
+                }
+                "moveDesktopToPhone" -> displays.moveToPhone { replyDisplayState(result, it) }
+                "getDesktopDisplaySettings" -> {
+                    try {
+                        val key = (call.arguments as? Map<*, *>)?.get("displayKey") as? String
+                        require(!key.isNullOrEmpty()) { "displayKey is required" }
+                        result.success(displays.settingsFor(key))
+                    } catch (error: DesktopDisplayException) {
+                        Log.w("DesktopDisplay", error.message, error)
+                        result.error(error.code, error.message, null)
+                    } catch (error: IllegalArgumentException) {
+                        result.error("INVALID_ARGUMENT", error.message, null)
+                    }
+                }
 
                 // ── Runtime Status ──
                 "getRuntimeStatus" -> {
@@ -565,11 +646,22 @@ class MainActivity : FlutterActivity() {
                             result.success(true)
                         }
                         "linux", "folder" -> {
+                            val reply = DesktopLaunchReply(result, displays)
+                            val epoch = try {
+                                displays.beginSession()
+                            } catch (error: DesktopDisplayException) {
+                                displayFailure(error, reply)
+                                return@setMethodCallHandler
+                            }
                             thread(name = "launch-desktop-item") {
+                                if (!displays.isSessionCurrent(epoch)) {
+                                    runOnUiThread { reply.error("SESSION_STOPPED", "Desktop launch was cancelled", null) }
+                                    return@thread
+                                }
                                 val rooted = chrootRuntime.hasRoot()
                                 val running = if (rooted) chrootRuntime.isRunning() else linuxRuntime.isRunning()
                                 if (!running) {
-                                    runOnUiThread { openDesktop(startSession = true) }
+                                    runOnUiThread { openDesktop(startSession = true, expectedEpoch = epoch) }
                                     if (rooted) chrootRuntime.waitForDesktopReady("xfce4")
                                     else linuxRuntime.waitForDesktopReady(linuxRuntime.getInstalledDE())
                                 }
@@ -583,11 +675,21 @@ class MainActivity : FlutterActivity() {
                                     }
                                     "DISPLAY=:0 thunar \"${if (chrootRuntime.hasRoot()) "/root" else filesDir.absolutePath + "/home"}${if (folder.isEmpty()) "" else "/$folder"}\" >/dev/null 2>&1 &"
                                 }
-                                if (rooted) chrootRuntime.executeCommand(command)
-                                else linuxRuntime.executeCommand(command)
+                                if (!displays.isSessionCurrent(epoch)) {
+                                    runOnUiThread { reply.error("SESSION_STOPPED", "Desktop launch was cancelled", null) }
+                                    return@thread
+                                }
+                                val launched = if (rooted) chrootRuntime.executeDesktopCommand(command)
+                                    else linuxRuntime.executeDesktopCommand(command)
                                 runOnUiThread {
-                                    if (running) openDesktop(startSession = false)
-                                    result.success(true)
+                                    if (!displays.isSessionCurrent(epoch)) {
+                                        reply.error("SESSION_STOPPED", "Desktop launch was cancelled", null)
+                                    } else if (launched.isFailure) {
+                                        reply.error("DESKTOP_LAUNCH_FAILED", launched.exceptionOrNull()?.message, null)
+                                    } else {
+                                        if (running) openDesktop(startSession = false, expectedEpoch = epoch)
+                                        reply.success(true)
+                                    }
                                 }
                             }
                         }
@@ -701,6 +803,7 @@ class MainActivity : FlutterActivity() {
                 }
                 "restoreDesktopSnapshot" -> {
                     val name = call.argument<String>("name") ?: ""
+                    displays.stop()
                     thread(name = "restore-desktop-snapshot") {
                         runCatching {
                             val rooted = chrootRuntime.hasRoot()
@@ -740,64 +843,59 @@ class MainActivity : FlutterActivity() {
 
                 // ── Start Linux session ──
                 "startLinux" -> {
+                    val startReply = DesktopLaunchReply(result, displays)
                     val desktopEnv = call.argument<String>("de") ?: "xfce4"
-                    val mode = call.argument<String>("mode") ?: "x11"
-                    var width = call.argument<Int>("width") ?: 1920
-                    var height = call.argument<Int>("height") ?: 1080
-
-                    if (height > 1080) {
-                        val scale = 1080.0 / height
-                        width = (width * scale).toInt()
-                        height = 1080
+                    val rooted = chrootRuntime.hasRoot()
+                    val epoch = try {
+                        displays.prepareSession(
+                            if (rooted) "chroot" else "termux", desktopEnv,
+                            !(if (rooted) chrootRuntime.isRunning() else linuxRuntime.isRunning()),
+                        )
+                    } catch (error: DesktopDisplayException) {
+                        displayFailure(error, startReply)
+                        return@setMethodCallHandler
                     }
-
                     startForegroundService()
-
-                    if (chrootRuntime.hasRoot()) {
+                    if (rooted) {
                         // Rooted fast path: chroot + LorieView
                         thread {
                             if (!chrootRuntime.isRootfsReady()) {
                                 Log.w(TAG, "Chroot rootfs not ready; cannot start session")
-                                runOnUiThread { result.success(false) }
+                                runOnUiThread {
+                                    val failure = IllegalStateException("Rootfs is not ready; complete Linux setup first")
+                                    displays.sessionStarted(epoch, Result.failure(failure))
+                                    startReply.error("SESSION_STOPPED", failure.message, null)
+                                }
                                 return@thread
                             }
                             runOnUiThread {
-                                val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-                                    putExtra("startSession", !chrootRuntime.isRunning())
-                                    putExtra("mode", "chroot")
-                                    putExtra("de", desktopEnv)
-                                }
-                                startActivity(intent)
-                                result.success(true)
+                                launchPreparedDesktop(epoch, startReply)
                             }
                         }
                     } else {
                         // Non-root fallback: native Termux path
                         installThread("start-linux-native") {
-                            linuxRuntime.extractBootstrapIfNeeded(applicationContext)
-                            val installed = linuxRuntime.getInstalledDE()
-                            val ready = installed == desktopEnv ||
-                                linuxRuntime.installDesktopEnvironmentNative(desktopEnv)
-                            if (!ready) {
-                                Log.e(TAG, "Native Termux desktop setup failed; session was not launched")
+                            try {
+                                linuxRuntime.extractBootstrapIfNeeded(applicationContext)
+                                val installed = linuxRuntime.getInstalledDE()
+                                val ready = installed == desktopEnv ||
+                                    linuxRuntime.installDesktopEnvironmentNative(desktopEnv)
+                                if (!ready) {
+                                    Log.e(TAG, "Native Termux desktop setup failed; session was not launched")
+                                    runOnUiThread {
+                                        val failure = IllegalStateException("Native Linux setup failed. Check the setup log.")
+                                        displays.sessionStarted(epoch, Result.failure(failure))
+                                        startReply.error("SESSION_STOPPED", failure.message, null)
+                                    }
+                                    return@installThread
+                                }
+                                runOnUiThread { launchPreparedDesktop(epoch, startReply) }
+                            } catch (error: Exception) {
+                                Log.e(TAG, "Native desktop preparation failed", error)
                                 runOnUiThread {
-                                    Toast.makeText(
-                                        this@MainActivity,
-                                        "Native Linux setup failed. Check the setup log.",
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                    result.success(false)
+                                    displays.sessionStarted(epoch, Result.failure(error))
+                                    startReply.error("SESSION_STOPPED", error.message, null)
                                 }
-                                return@installThread
-                            }
-                            runOnUiThread {
-                                val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-                                    putExtra("startSession", !linuxRuntime.isRunning())
-                                    putExtra("mode", "termux")
-                                    putExtra("de", desktopEnv)
-                                }
-                                startActivity(intent)
-                                result.success(true)
                             }
                         }
                     }
@@ -807,27 +905,17 @@ class MainActivity : FlutterActivity() {
                     val rooted = chrootRuntime.hasRoot()
                     // Flutter's "running" state can be stale (e.g. after Stop from the notification).
                     val running = if (rooted) chrootRuntime.isRunning() else linuxRuntime.isRunning()
-                    if (!running) startForegroundService()
-                    val intent = Intent(this@MainActivity, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-                        putExtra("startSession", !running)
-                        putExtra("mode", if (rooted) "chroot" else "termux")
-                        putExtra("de", if (rooted) "xfce4" else linuxRuntime.getInstalledDE())
-                    }
-                    startActivity(intent)
-                    result.success(true)
+                    requestDesktop(
+                        if (rooted) "chroot" else "termux",
+                        if (rooted) "xfce4" else linuxRuntime.getInstalledDE(), !running, result,
+                    )
                 }
 
                 "stopLinux" -> {
-                    // A desktop screen left in the back stack would reopen onto a dead session.
-                    com.orailnoor.droiddesk.view.DesktopActivity.finishIfOpen()
-                    thread(name = "stop-linux-session") {
-                        if (chrootRuntime.hasRoot() || chrootRuntime.isRunning()) {
-                            chrootRuntime.stopSession()
-                        }
-                        linuxRuntime.stopSession()
-                        stopService(Intent(this@MainActivity, X11ServerService::class.java))
-                        stopForegroundService()
-                        runOnUiThread { result.success(true) }
+                    DroidDeskService.stopDesktop(applicationContext) { outcome ->
+                        val error = outcome.exceptionOrNull()
+                        if (error == null) result.success(true)
+                        else result.error("STOP_FAILED", error.message, null)
                     }
                 }
 
@@ -943,11 +1031,9 @@ class MainActivity : FlutterActivity() {
                 sessionRoot = rootfs,
             )
             if (chrootRuntime.isRunning()) {
-                chrootRuntime.executeCommand(
-                    "export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session; " +
-                        AndroidAppBridge.xfceDockCommand(this) +
-                        " DISPLAY=:0 xfce4-panel -r >/dev/null 2>&1 || true",
-                )
+                chrootRuntime.executeDesktopCommand(
+                    AndroidAppBridge.xfceDockCommand(this) + " DISPLAY=:0 xfce4-panel -r",
+                ).getOrThrow()
             }
         } else {
             AndroidAppBridge.syncLaunchers(
@@ -956,22 +1042,72 @@ class MainActivity : FlutterActivity() {
                 python = java.io.File(filesDir, "usr/bin/python3"),
             )
             if (linuxRuntime.isRunning()) {
-                linuxRuntime.executeCommand(
+                linuxRuntime.executeDesktopCommand(
                     AndroidAppBridge.xfceDockCommand(this) +
-                        " DISPLAY=:0 xfce4-panel -r >/dev/null 2>&1 || true",
-                )
+                        " DISPLAY=:0 xfce4-panel -r",
+                ).getOrThrow()
             }
         }
     }
 
-    private fun openDesktop(startSession: Boolean) {
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        displayStateSubscription?.invoke()
+        displayStateSubscription = null
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    private fun openDesktop(startSession: Boolean, expectedEpoch: Long? = null) {
         val rooted = chrootRuntime.hasRoot()
-        startForegroundService()
-        startActivity(Intent(this, com.orailnoor.droiddesk.view.DesktopActivity::class.java).apply {
-            putExtra("startSession", startSession)
-            putExtra("mode", if (rooted) "chroot" else "termux")
-            putExtra("de", if (rooted) "xfce4" else linuxRuntime.getInstalledDE())
-        })
+        requestDesktop(
+            if (rooted) "chroot" else "termux",
+            if (rooted) "xfce4" else linuxRuntime.getInstalledDE(), startSession, expectedEpoch = expectedEpoch,
+        )
+    }
+
+    private fun requestDesktop(
+        mode: String,
+        desktop: String,
+        start: Boolean,
+        result: MethodChannel.Result? = null,
+        expectedEpoch: Long? = null,
+    ) {
+        val coordinator = DesktopDisplayCoordinator.shared
+        if (expectedEpoch != null && !coordinator.isSessionCurrent(expectedEpoch)) {
+            displayFailure(DesktopDisplayException("SESSION_STOPPED", "The session was stopped before launch"), result)
+            return
+        }
+        try {
+            val epoch = coordinator.prepareSession(mode, desktop, start, expectedEpoch = expectedEpoch)
+            startForegroundService()
+            launchPreparedDesktop(epoch, result)
+        } catch (error: DesktopDisplayException) {
+            displayFailure(error, result)
+        }
+    }
+
+    private fun launchPreparedDesktop(epoch: Long, result: MethodChannel.Result?) {
+        val coordinator = DesktopDisplayCoordinator.shared
+        if (!coordinator.isSessionCurrent(epoch)) {
+            displayFailure(DesktopDisplayException("SESSION_STOPPED", "The Linux session was stopped"), result)
+            return
+        }
+        coordinator.openActive { outcome ->
+            val error = outcome.exceptionOrNull()
+            if (error != null) displayFailure(error, result) else result?.success(true)
+        }
+    }
+
+    private fun replyDisplayState(result: MethodChannel.Result, outcome: Result<Unit>) {
+        val error = outcome.exceptionOrNull()
+        if (error == null) result.success(DesktopDisplayCoordinator.shared.snapshot())
+        else displayFailure(error, result)
+    }
+
+    private fun displayFailure(error: Throwable, result: MethodChannel.Result? = null) {
+        Log.w("DesktopDisplay", "Desktop operation failed", error)
+        val code = (error as? DesktopDisplayException)?.code ?: "DISPLAY_UNAVAILABLE"
+        if (result != null) result.error(code, error.message, null)
+        else Toast.makeText(this, error.message ?: "Desktop placement failed", Toast.LENGTH_LONG).show()
     }
 
     private fun runPackageOperation(

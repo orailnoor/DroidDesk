@@ -100,6 +100,9 @@ public class TouchInputHandler {
     private InputStrategyInterface mInputStrategy;
     private final InputEventSender mInjector;
     private final MainActivity mActivity;
+    private final InputManager mInputManager;
+    private final InputManager.InputDeviceListener mInputDeviceListener;
+    private boolean disposed;
     private final DisplayMetrics mMetrics = new DisplayMetrics();
     private final float[] mappedPoint = new float[2];
     private final float[] matrixValues = new float[9];
@@ -148,19 +151,25 @@ public class TouchInputHandler {
     private static final DisplayManager.DisplayListener mDisplayListener = new DisplayManager.DisplayListener() {
         @Override
         public void onDisplayAdded(int displayId) {
-            mDisplayRotation = mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY).getRotation() % 4;
+            updateDisplayRotation();
         }
 
         @Override
         public void onDisplayRemoved(int displayId) {
-            mDisplayRotation = mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY).getRotation() % 4;
+            updateDisplayRotation();
         }
 
         @Override
         public void onDisplayChanged(int displayId) {
-            mDisplayRotation = mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY).getRotation() % 4;
+            updateDisplayRotation();
         }
     };
+
+    private static void updateDisplayRotation() {
+        LorieView view = MainActivity.getInstance().getLorieView();
+        Display display = view != null ? view.getDisplay() : null;
+        mDisplayRotation = display != null ? display.getRotation() % 4 : 0;
+    }
 
     @CapturedPointerTransformation static int capturedPointerTransformation = CapturedPointerTransformation.NONE;
     private final int[][] buttons = {
@@ -188,7 +197,7 @@ public class TouchInputHandler {
         mActivity = activity;
         if (mDisplayManager == null) {
             mDisplayManager = (DisplayManager) mActivity.getSystemService(Context.DISPLAY_SERVICE);
-            mDisplayRotation = mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY).getRotation() % 4;
+            updateDisplayRotation();
             mDisplayManager.registerDisplayListener(mDisplayListener, null);
         }
 
@@ -217,9 +226,11 @@ public class TouchInputHandler {
         mTouchpadHandler = isTouchpad ? null : new TouchInputHandler(activity, mRenderData, injector, true);
 
         refreshInputDevices();
-        ((InputManager) mActivity.getSystemService(Context.INPUT_SERVICE)).registerInputDeviceListener(new InputManager.InputDeviceListener() {
+        mInputManager = (InputManager) mActivity.getSystemService(Context.INPUT_SERVICE);
+        mInputDeviceListener = new InputManager.InputDeviceListener() {
             @Override
             public void onInputDeviceAdded(int deviceId) {
+                if (disposed) return;
                 InputDevice dev = InputDevice.getDevice(deviceId);
                 String name = dev != null ? dev.getName() : "null";
                 android.util.Log.d("InputDeviceListener", "added " + name);
@@ -228,23 +239,33 @@ public class TouchInputHandler {
 
             @Override
             public void onInputDeviceRemoved(int deviceId) {
+                if (disposed) return;
                 android.util.Log.d("InputDeviceListener", "device removed");
                 refreshInputDevices();
             }
 
             @Override
             public void onInputDeviceChanged(int deviceId) {
+                if (disposed) return;
                 InputDevice dev = InputDevice.getDevice(deviceId);
                 String name = dev != null ? dev.getName() : "null";
                 android.util.Log.d("InputDeviceListener", "changed " + name);
                 refreshInputDevices();
             }
-        }, null);
+        };
+        mInputManager.registerInputDeviceListener(mInputDeviceListener, null);
 
     }
 
     public TouchInputHandler(MainActivity activity, final InputEventSender injector) {
         this(activity, null, injector, false);
+    }
+
+    public void dispose() {
+        if (disposed) return;
+        disposed = true;
+        mInputManager.unregisterInputDeviceListener(mInputDeviceListener);
+        if (mTouchpadHandler != null) mTouchpadHandler.dispose();
     }
 
     static public void refreshInputDevices() {
@@ -288,6 +309,7 @@ public class TouchInputHandler {
     }
 
     public boolean handleTouchEvent(View view0, View view, MotionEvent event) {
+        if (disposed) return false;
         if (ignoreGamepadEvents && (event.isFromSource(InputDevice.SOURCE_GAMEPAD) || event.isFromSource(InputDevice.SOURCE_JOYSTICK)))
             return true;
 
@@ -406,6 +428,7 @@ public class TouchInputHandler {
     }
 
     public void setCapturingEnabled(boolean enabled) {
+        if (disposed || mActivity.getLorieView() == null) return;
         if (mInjector.pointerCapture && enabled)
             mActivity.getLorieView().requestPointerCapture();
         else
@@ -432,6 +455,7 @@ public class TouchInputHandler {
     }
 
     public void reloadPreferences(Prefs p) {
+        updateDisplayRotation();
         setInputMode(Integer.parseInt(p.touchMode.get()));
         mInjector.tapToMove = p.tapToMove.get();
         mInjector.preferScancodes = p.preferScancodes.get();
@@ -794,6 +818,7 @@ public class TouchInputHandler {
     }
 
     public boolean sendKeyEvent(KeyEvent e) {
+        if (disposed) return false;
         if (ignoreGamepadEvents && (e.isFromSource(InputDevice.SOURCE_GAMEPAD) || e.isFromSource(InputDevice.SOURCE_JOYSTICK)))
             return true;
 

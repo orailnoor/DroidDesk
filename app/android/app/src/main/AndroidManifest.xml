@@ -27,7 +27,7 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
-        android:label="DroidDesk"
+        android:label="${appLabel}"
         android:name="${applicationName}"
         android:icon="@mipmap/launcher_icon"
         android:requestLegacyExternalStorage="true"
@@ -64,9 +64,12 @@
         <!-- Native Desktop Activity -->
         <activity
             android:name=".view.DesktopActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-            android:launchMode="singleTop"
-            android:taskAffinity=""
+            android:launchMode="standard"
+            android:taskAffinity="${applicationId}.desktop"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
 
         <!-- The native X server must have a different Linux process and FD table than LorieView. -->

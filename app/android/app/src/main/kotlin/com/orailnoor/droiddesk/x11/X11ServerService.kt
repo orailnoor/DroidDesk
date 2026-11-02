@@ -90,10 +90,9 @@ class X11ServerService : Service() {
                     } catch (error: Throwable) {
                         Log.e(TAG, "Native X server failed to start", error)
                         false
-                    } finally {
-                        started = true
-                        latch.countDown()
                     }
+                    started = true
+                    latch.countDown()
                     Log.i(TAG, "Native X server start result=$startSucceeded")
                 }
             }

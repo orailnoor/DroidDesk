@@ -2,12 +2,21 @@ package com.orailnoor.droiddesk.runtime
 
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.io.File
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import java.util.UUID
+import java.util.concurrent.Executors
+import com.orailnoor.droiddesk.display.DisplayProfile
+import com.orailnoor.droiddesk.display.DisplayProfilePolicy
+
+internal fun nativeDesktopBusSocket(directory: File): File =
+    File(directory, UUID.randomUUID().toString().replace("-", ""))
 
 /**
  * Core Linux runtime engine.
@@ -16,7 +25,8 @@ import java.util.zip.ZipInputStream
  * Uses a C hook (libsocket_hook.so) via LD_PRELOAD to redirect file operations
  * and Unix socket connections from /data/data/com.termux/files/usr to DroidDesk's prefix.
  */
-class LinuxRuntime(private val context: Context) {
+class LinuxRuntime(context: Context) {
+    private val context = context.applicationContext
 
     companion object {
         private const val TAG = "LinuxRuntime"
@@ -68,6 +78,9 @@ class LinuxRuntime(private val context: Context) {
         // wrappers operate on the same session.
         @Volatile private var sessionProcess: Process? = null
         @Volatile private var dbusProcess: Process? = null
+        @Volatile private var sessionBusAddress: String? = null
+        private var sessionBusSocket: File? = null
+        private var displayProfiles: DesktopProfileExecutor? = null
     }
 
     @Volatile private var activeCommandProcess: Process? = null
@@ -1125,7 +1138,8 @@ class LinuxRuntime(private val context: Context) {
             env["GALLIUM_DRIVER"] = "llvmpipe"
         }
 
-        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=${tmpDir.absolutePath}/dbus-session"
+        env["DBUS_SESSION_BUS_ADDRESS"] = sessionBusAddress ?: "unix:path=${tmpDir.absolutePath}/dbus-session"
+        env["XDG_CONFIG_HOME"] = File(homeDir, ".config").absolutePath
 
         env["DPKG_ADMINDIR"] = "${prefixDir.absolutePath}/var/lib/dpkg"
         env["APT_CONFIG"] = "${prefixDir.absolutePath}/etc/apt/apt.conf.d/99-droiddesk-paths.conf"
@@ -1930,7 +1944,11 @@ class LinuxRuntime(private val context: Context) {
 
     // ── Session Management ──
 
-    fun startSession(desktopEnv: String = "xfce4", mode: String = "x11", width: Int = 1920, height: Int = 1080) {
+    fun startSession(
+        desktopEnv: String = "xfce4",
+        mode: String = "x11",
+        displayProfile: DisplayProfile? = null,
+    ) {
         val selectedDesktop = normalizedDesktop(desktopEnv)
         extractBootstrapIfNeeded(context)
 
@@ -2009,9 +2027,11 @@ class LinuxRuntime(private val context: Context) {
         // Start a session dbus-daemon and keep it as a child process. Do not use
         // --fork: a forked daemon can outlive the Android activity and leave an
         // orphaned bus behind after its socket is replaced.
-        val dbusSocket = File(tmpDir, "dbus-session")
+        val dbusSocket = nativeDesktopBusSocket(tmpDir)
         try {
             dbusProcess?.destroyForcibly()
+            sessionBusSocket?.delete()
+            sessionBusAddress = null
             if (dbusSocket.exists()) dbusSocket.delete()
             val dbusConfig = File(tmpDir, "dbus-session.conf")
             dbusConfig.writeText(
@@ -2067,12 +2087,15 @@ class LinuxRuntime(private val context: Context) {
             check(dbusSocket.exists() && startedDbus.isAlive) {
                 "dbus-daemon did not create its session socket"
             }
+            sessionBusSocket = dbusSocket
+            sessionBusAddress = "unix:path=${dbusSocket.absolutePath}"
             Log.i(TAG, "Session dbus-daemon ready")
         } catch (e: Exception) {
             Log.e(TAG, "dbus-daemon start failed: ${e.message}")
             dbusProcess?.destroyForcibly()
             dbusProcess = null
-            return
+            sessionBusAddress = null
+            throw IllegalStateException("The desktop session bus could not start", e)
         }
 
         // The Termux startxfce4 wrapper falls back to Android's /bin/sh when an
@@ -2080,6 +2103,7 @@ class LinuxRuntime(private val context: Context) {
         // releases. The session binary starts the same XFCE components and
         // preserves DroidDesk's prepared environment.
         val desktopCommand = "xfce4-session"
+        val stagedProfile = XfceDisplayProfile.buildStageScript(displayProfile ?: DisplayProfilePolicy.phoneDefaultProfile())
 
         val runScript = """
             # ── Disable AT-SPI accessibility bus ──
@@ -2089,6 +2113,16 @@ class LinuxRuntime(private val context: Context) {
 
             # Use the session bus DroidDesk already started
             export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbusSocket.absolutePath}"
+
+            (
+$stagedProfile
+            )
+            if command -v xrdb >/dev/null 2>&1; then
+                if [ -f "${'$'}HOME/.Xresources" ]; then xrdb -merge "${'$'}HOME/.Xresources"; fi
+                xrdb -merge "${'$'}{XDG_CONFIG_HOME:-${'$'}HOME/.config}/droiddesk/display-profile.Xresources"
+            else
+                echo "DIAG: xrdb unavailable; live profile application will report the missing helper"
+            fi
 
             # PulseAudio daemonizes, so it outlives a stopped session. A wedged
             # one makes every pactl/pulseaudio call (and XFCE's event sounds)
@@ -2191,6 +2225,7 @@ class LinuxRuntime(private val context: Context) {
 
     fun stopSession() {
         Log.i(TAG, "Stopping Linux session...")
+        cancelDisplayProfile()
         sessionProcess?.let {
             it.destroyForcibly()
             it.waitFor()
@@ -2198,7 +2233,53 @@ class LinuxRuntime(private val context: Context) {
         sessionProcess = null
         dbusProcess?.destroyForcibly()
         dbusProcess = null
+        sessionBusAddress = null
+        sessionBusSocket?.let {
+            if (it.exists() && !it.delete()) Log.w(TAG, "Could not remove the retired desktop bus socket")
+        }
+        sessionBusSocket = null
         Log.i(TAG, "Session stopped")
+    }
+
+    fun applyDisplayProfile(profile: DisplayProfile, onComplete: (Result<Unit>) -> Unit) {
+        try {
+            val runner = captureDesktopRunner()
+            val executor = synchronized(Companion) {
+                displayProfiles ?: DesktopProfileExecutor(
+                    Executors.newSingleThreadExecutor { task -> Thread(task, "NativeDesktopProfiles") },
+                    { task -> Handler(Looper.getMainLooper()).post(task) },
+                ).also { displayProfiles = it }
+            }
+            val script = XfceDisplayProfile.buildApplyScript(profile)
+            executor.apply({ runner.run(script) }, onComplete)
+        } catch (error: IllegalStateException) {
+            Log.e("DesktopDisplay", "Native profile has no live session environment", error)
+            onComplete(Result.failure(error))
+        }
+    }
+
+    fun cancelDisplayProfile() {
+        displayProfiles?.cancel()
+    }
+
+    fun executeDesktopCommand(command: String): Result<Unit> = try {
+        captureDesktopRunner().run(command)
+    } catch (error: IllegalStateException) {
+        Log.e("DesktopDisplay", "Native desktop command has no live session", error)
+        Result.failure(error)
+    }
+
+    private fun captureDesktopRunner(): DesktopCommandRunner {
+        val session = checkNotNull(sessionProcess) { "The native desktop session is not running" }
+        check(session.isAlive) { "The native desktop session ended" }
+        val bus = checkNotNull(sessionBusAddress) { "The native desktop bus is unavailable" }
+        val environment = getTermuxEnv().toMutableMap().apply { this["DBUS_SESSION_BUS_ADDRESS"] = bus }
+        return DesktopCommandRunner({ script ->
+            check(sessionProcess === session && session.isAlive) { "The native desktop session changed" }
+            ProcessBuilder(File(binDir, "bash").absolutePath, "-c", script)
+                .directory(homeDir)
+                .also { it.environment().clear(); it.environment().putAll(environment) }
+        }) { Log.e("DesktopDisplay", it) }
     }
 
     // ── Command Execution ──

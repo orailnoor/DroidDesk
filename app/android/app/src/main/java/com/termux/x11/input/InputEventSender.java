@@ -53,6 +53,19 @@ public final class InputEventSender {
         mPressedKeys = new TreeSet<>();
     }
 
+    public void releaseAll() {
+        Integer[] keys = mPressedKeys.toArray(new Integer[0]);
+        mPressedKeys.clear();
+        mPressedTextKeys.clear();
+        for (int key : keys) mInjector.sendKeyEvent(0, key, false);
+        for (int button : new int[] {BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT})
+            mInjector.sendMouseEvent(0, 0, button, false, true);
+        for (int pointer = 0; pointer < pointers.length; pointer++) {
+            mInjector.sendTouchEvent(XI_TouchEnd, pointer, 0, 0);
+            pointers[pointer] = false;
+        }
+    }
+
     private static final int[][] MODIFIER_KEYS = {
         {META_SHIFT_ON, KEYCODE_SHIFT_LEFT, KEYCODE_SHIFT_RIGHT},
         {META_CTRL_ON, KEYCODE_CTRL_LEFT, KEYCODE_CTRL_RIGHT},

@@ -20,7 +20,19 @@ build/
 key.properties
 local.properties
 
+# Contributor-local Superpowers engineering references.
+/.superpower/
+/.superpowers/
+/docs/superpower/
+/docs/superpowers/
+
+# Local-only validation, not runtime or current GitHub Actions.
+/app/android/app/src/androidTest/
+/app/android/app/src/test/
+/app/test/
+
 # Local diagnostics and one-off development artifacts.
+/.local-diagnostics/
 /PROJECT_STATUS.md
 /TestFd.kt
 /TestZip.java

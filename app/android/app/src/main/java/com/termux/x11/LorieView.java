@@ -49,6 +49,7 @@ import android.view.inputmethod.TextSnapshot;
 
 import androidx.annotation.Keep;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.core.math.MathUtils;
 
 import com.termux.x11.input.InputStub;
@@ -350,7 +351,15 @@ public class LorieView extends SurfaceView implements InputStub {
     private static boolean hardwareKbdScancodesWorkaround = false;
     private final InputMethodManager mIMM = (InputMethodManager)getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
     private Callback mCallback;
+    private boolean rendererReleased;
+
+    private boolean isRendererOwner() {
+        return !rendererReleased && MainActivity.getInstance().getLorieView() == this;
+    }
     private final Point p = new Point();
+    private Point desktopRenderSize;
+    private int lastSentWidth, lastSentHeight, lastSentFramerate;
+    private String lastSentName;
     private final Rect contentInsets = new Rect();
     private final Rect viewport = new Rect();
     private final Rect inputViewport = new Rect();
@@ -409,6 +418,7 @@ public class LorieView extends SurfaceView implements InputStub {
         int currentPos = 1, requestedPos;
         boolean resetCursorPosition;
         void sendCursorPosition() {
+            if (!isRendererOwner()) return;
             if (resetCursorPosition) {
                 mIMM.updateSelection(LorieView.this, -1, -1, -1, -1);
                 currentPos = 1;
@@ -436,6 +446,7 @@ public class LorieView extends SurfaceView implements InputStub {
         }
 
         void sendKey(int k) {
+            if (!isRendererOwner()) return;
             LorieView.this.sendKeyEvent(0, k, true);
             LorieView.this.sendKeyEvent(0, k, false);
         }
@@ -443,15 +454,18 @@ public class LorieView extends SurfaceView implements InputStub {
         @Override public boolean performEditorAction(int actionCode) {
             // Android IMEs normally deliver the return key as an editor action,
             // not as committed text. X11 needs a real Return press/release.
-            sendKey(KeyEvent.KEYCODE_ENTER);
-            unsetSpecialKeys();
-            return true;
+            return RendererActionGuard.run(LorieView.this::isRendererOwner, () -> {
+                sendKey(KeyEvent.KEYCODE_ENTER);
+                unsetSpecialKeys();
+            });
         }
 
         /** Lets the extra-keys bar release one-shot Ctrl/Alt after a key was typed. */
         void unsetSpecialKeys() {
-            if (a.useTermuxEKBarBehaviour && a.mExtraKeys != null)
-                a.mExtraKeys.unsetSpecialKeys();
+            RendererActionGuard.run(LorieView.this::isRendererOwner, () -> {
+                if (a.useTermuxEKBarBehaviour && a.mExtraKeys != null)
+                    a.mExtraKeys.unsetSpecialKeys();
+            });
         }
 
         @Override public boolean deleteSurroundingText(int beforeLength, int afterLength) {
@@ -492,6 +506,7 @@ public class LorieView extends SurfaceView implements InputStub {
          *
          * @noinspection SameReturnValue*/
         boolean replaceText(CharSequence newText, boolean reuse) {
+            if (!isRendererOwner()) return false;
             int oldLen = currentComposingText != null ? currentComposingText.length() : 0;
             int newLen = newText != null ? newText.length() : 0;
             if (oldLen > 0 && newLen > 0 && (currentComposingText.toString().startsWith(newText.toString())
@@ -509,8 +524,7 @@ public class LorieView extends SurfaceView implements InputStub {
 
             currentComposingText = reuse ? newText : null;
 
-            if (a.useTermuxEKBarBehaviour && a.mExtraKeys != null)
-                a.mExtraKeys.unsetSpecialKeys();
+            unsetSpecialKeys();
             commitedText = true;
             return true;
         }
@@ -543,6 +557,7 @@ public class LorieView extends SurfaceView implements InputStub {
 
         @Override
         public boolean commitText(CharSequence text, int newPos) {
+            if (!isRendererOwner()) return false;
             // Some keyboards commit a newline instead of invoking an editor
             // action. Treat a standalone newline as the X11 Return key.
             if ("\n".contentEquals(text) || "\r\n".contentEquals(text)) {
@@ -573,6 +588,7 @@ public class LorieView extends SurfaceView implements InputStub {
 
         @Override
         public boolean sendKeyEvent(KeyEvent event) {
+            if (!isRendererOwner()) return false;
             // Route special IME and hardware keys through the same input state
             // machine used by Termux:X11. Fall back to direct native injection
             // while the controller is being attached.
@@ -608,7 +624,7 @@ public class LorieView extends SurfaceView implements InputStub {
             holder.setFormat(PixelFormat.BGRA_8888);
             Log.i("LorieView", "surfaceCreated called!");
             MainActivity.handler.post(() -> {
-                if (MainActivity.getInstance() != null) {
+                if (isRendererOwner()) {
                     LorieView.this.surfaceChanged(holder.getSurface());
                     updateViewport();
                 }
@@ -616,6 +632,7 @@ public class LorieView extends SurfaceView implements InputStub {
         }
 
         @Override public void surfaceChanged(@NonNull SurfaceHolder holder, int f, int width, int height) {
+            if (!isRendererOwner()) return;
             Log.i("LorieView", "surfaceChanged called with width=" + width + ", height=" + height);
             LorieView.this.surfaceChanged(holder.getSurface());
             width = getMeasuredWidth();
@@ -626,7 +643,7 @@ public class LorieView extends SurfaceView implements InputStub {
         }
 
         @Override public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
-            LorieView.this.surfaceChanged(null);
+            if (isRendererOwner()) LorieView.this.surfaceChanged(null);
         }
     };
 
@@ -668,11 +685,43 @@ public class LorieView extends SurfaceView implements InputStub {
     }
 
     public void triggerCallback() {
+        if (!isRendererOwner()) return;
         requestFocus();
         updateViewport();
     }
 
+    public void refreshRenderer() {
+        if (!isRendererOwner()) return;
+        if (getHolder().getSurface().isValid())
+            surfaceChanged(getHolder().getSurface());
+        triggerCallback();
+    }
+
+    public void onXConnectionChanged() {
+        if (!isRendererOwner()) return;
+        lastSentWidth = lastSentHeight = lastSentFramerate = 0;
+        lastSentName = null;
+        refreshRenderer();
+    }
+
+    public void releaseRenderer() {
+        if (rendererReleased) return;
+        if (isRendererOwner()) surfaceChanged(null);
+        rendererReleased = true;
+        keyReleaseHandler.removeCallbacksAndMessages(null);
+        clipboard.removePrimaryClipChangedListener(clipboardListener);
+        getHolder().removeCallback(mSurfaceCallback);
+        mCallback = null;
+        setOnTouchListener(null);
+        setOnGenericMotionListener(null);
+        if (hasPointerCapture()) releasePointerCapture();
+    }
+
     void getDimensionsFromSettings(int width, int height) {
+        if (desktopRenderSize != null) {
+            p.set(X11RenderGeometry.alignedWidth(desktopRenderSize.x, desktopRenderSize.y), desktopRenderSize.y);
+            return;
+        }
         Prefs prefs = MainActivity.getPrefs();
         int w = width;
         int h = height;
@@ -705,9 +754,9 @@ public class LorieView extends SurfaceView implements InputStub {
         }
 
         if (prefs.adjustResolution.get() && ((width < height && w > h) || (width > height && w < h)))
-            p.set(h, w);
+            p.set(X11RenderGeometry.alignedWidth(h, w), w);
         else
-            p.set(w, h);
+            p.set(X11RenderGeometry.alignedWidth(w, h), h);
     }
 
     private Matrix getInputTransform() {
@@ -724,10 +773,7 @@ public class LorieView extends SurfaceView implements InputStub {
     }
 
     private void sendWindowChange() {
-        // Send the first geometry as soon as the Surface is available. The
-        // native side retains it until the Binder-provided X connection is
-        // attached; delaying it makes a fresh server allocate its 1280x1024
-        // fallback framebuffer before it learns the phone's real size.
+        if (!connected()) return;
 
         String name;
         int framerate = (int) (getDisplay() != null ? getDisplay().getRefreshRate() : 30);
@@ -739,20 +785,50 @@ public class LorieView extends SurfaceView implements InputStub {
         else
             name = "external";
 
+        if (p.x == lastSentWidth && p.y == lastSentHeight &&
+                framerate == lastSentFramerate && name.equals(lastSentName))
+            return;
+        lastSentWidth = p.x;
+        lastSentHeight = p.y;
+        lastSentFramerate = framerate;
+        lastSentName = name;
         Log.e("LorieView", "SENDING WINDOW CHANGE NATIVE: " + p.x + "x" + p.y + " framerate=" + framerate + " name=" + name);
         sendWindowChange(p.x, p.y, framerate, name);
+    }
+
+    public void setDesktopRenderSize(int width, int height) {
+        if (width <= 0 || height <= 0)
+            throw new IllegalArgumentException("Desktop render size must be positive");
+        if (desktopRenderSize != null && desktopRenderSize.x == width && desktopRenderSize.y == height)
+            return;
+        desktopRenderSize = new Point(width, height);
+        updateViewport();
+    }
+
+    public void clearDesktopRenderSize() {
+        desktopRenderSize = null;
+        updateViewport();
+    }
+
+    @Nullable
+    public Point getRenderedSize() {
+        return isRendererOwner() && getMeasuredWidth() > 0 && getMeasuredHeight() > 0 && p.x > 0 && p.y > 0
+                ? new Point(p) : null;
     }
 
     @Keep
     @SuppressWarnings("unused")
     private static void setRendererViewport(int viewportLeft, int viewportTop, int viewportWidth, int viewportHeight,
                                             float sourceLeft, float sourceTop, float sourceWidth, float sourceHeight) {
+        final LorieView expected = MainActivity.getInstance().getLorieView();
         MainActivity.handler.post(() -> {
             MainActivity activity = MainActivity.getInstance();
             if (activity == null)
                 return;
 
             LorieView view = activity.getLorieView();
+            if (view == null || view != expected || !view.isRendererOwner())
+                return;
             view.inputViewport.set(viewportLeft, viewportTop, viewportLeft + viewportWidth, viewportTop + viewportHeight);
             view.inputSourceLeft = sourceLeft;
             view.inputSourceTop = sourceTop;
@@ -771,16 +847,11 @@ public class LorieView extends SurfaceView implements InputStub {
     }
 
     private void updateViewport() {
+        if (!isRendererOwner()) return;
         Prefs prefs = MainActivity.getPrefs();
 
         int surfaceW = getMeasuredWidth(), surfaceH = getMeasuredHeight();
-        if (surfaceW == 0 || surfaceH == 0) {
-            android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
-            MainActivity.getRealMetrics(metrics);
-            surfaceW = metrics.widthPixels;
-            surfaceH = metrics.heightPixels;
-            Log.w("LorieView", "View not measured! Falling back to screen metrics: " + surfaceW + "x" + surfaceH);
-        }
+        if (surfaceW <= 0 || surfaceH <= 0) return;
 
         int availableLeft = contentInsets.left, availableTop = contentInsets.top;
         int availableW = Math.max(0, surfaceW - contentInsets.left - contentInsets.right);
@@ -795,11 +866,13 @@ public class LorieView extends SurfaceView implements InputStub {
         int drawH = availableH;
 
         if (!prefs.displayStretch.get()) {
-            if (drawW > drawH * p.x / p.y)
-                drawW = drawH * p.x / p.y;
+            if (drawW > (long) drawH * p.x / p.y)
+                drawW = (int) ((long) drawH * p.x / p.y);
             else
-                drawH = drawW * p.y / p.x;
+                drawH = (int) ((long) drawW * p.y / p.x);
         }
+        drawW = Math.max(1, drawW);
+        drawH = Math.max(1, drawH);
 
         int left = availableLeft + (availableW - drawW) / 2;
         int top = availableTop + (availableH - drawH) / 2;
@@ -839,13 +912,14 @@ public class LorieView extends SurfaceView implements InputStub {
 
     Handler keyReleaseHandler = new Handler(Looper.getMainLooper()) {
         @Override public void handleMessage(Message msg) {
-            if (msg.what != 0)
+            if (msg.what != 0 && isRendererOwner())
                 sendKeyEvent(0, msg.what, false);
         }
     };
 
     @Override
     public boolean dispatchKeyEventPreIme(KeyEvent event) {
+        if (!isRendererOwner()) return false;
         if (imeBuggyKeys.contains(event.getKeyCode())) {
             // IME does not handle/send events for some keys correctly correctly.
             // So we should send key release manually in the case if IME will not send it...
@@ -886,6 +960,7 @@ public class LorieView extends SurfaceView implements InputStub {
 
     // It is used in native code
     void setClipboardText(String text) {
+        if (!isRendererOwner()) return;
         clipboard.setPrimaryClip(ClipData.newPlainText("X11 clipboard", text));
 
         // Android does not send PrimaryClipChanged event to the window which posted event
@@ -896,6 +971,7 @@ public class LorieView extends SurfaceView implements InputStub {
 
     /** @noinspection unused*/ // It is used in native code
     void requestClipboard() {
+        if (!isRendererOwner()) return;
         if (!clipboardSyncEnabled) {
             sendClipboardEvent("".getBytes(UTF_8));
             return;
@@ -914,6 +990,7 @@ public class LorieView extends SurfaceView implements InputStub {
     }
 
     public void checkForClipboardChange() {
+        if (!isRendererOwner()) return;
         ClipDescription desc = clipboard.getPrimaryClipDescription();
         if (clipboardSyncEnabled && desc != null &&
                 lastClipboardTimestamp < desc.getTimestamp() &&
@@ -930,7 +1007,8 @@ public class LorieView extends SurfaceView implements InputStub {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
 
-        requestFocus();
+        if (!isRendererOwner()) return;
+        if (hasFocus) requestFocus();
 
         if (clipboardSyncEnabled && hasFocus) {
             clipboard.addPrimaryClipChangedListener(clipboardListener);
@@ -943,6 +1021,7 @@ public class LorieView extends SurfaceView implements InputStub {
 
     @Override
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+        if (!isRendererOwner()) return null;
         if (MainActivity.getPrefs().enforceCharBasedInput.get())
             outAttrs.inputType = InputType.TYPE_NULL;
         else
@@ -967,6 +1046,7 @@ public class LorieView extends SurfaceView implements InputStub {
             return;
 
         postDelayed(() -> {
+            if (!isRendererOwner()) return;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                 mIMM.invalidateInput(this);
             else
@@ -1002,6 +1082,7 @@ public class LorieView extends SurfaceView implements InputStub {
     @FastNative public native void sendStylusEvent(float x, float y, int pressure, int tiltX, int tiltY, int orientation, int buttons, boolean eraser, boolean mouseMode);
     @FastNative static public native void requestStylusEnabled(boolean enabled);
     public boolean sendKeyEvent(int scanCode, int keyCode, boolean keyDown) {
+        if (!isRendererOwner()) return false;
 //        if (keyCode == 67)
 //            new Exception().printStackTrace();
         return sendKeyEvent(scanCode, keyCode, keyDown, 0);

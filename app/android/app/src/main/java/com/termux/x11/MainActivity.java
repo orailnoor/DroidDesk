@@ -2,6 +2,7 @@ package com.termux.x11;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.res.Resources;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
@@ -14,6 +15,7 @@ public class MainActivity extends Activity {
     public static final String ACTION_CUSTOM = "com.termux.x11.ACTION_CUSTOM";
     
     private LorieView lorieView;
+    private long lorieGeneration = -1;
     public interface KeyHandler {
         boolean handle(KeyEvent event);
     }
@@ -33,18 +35,44 @@ public class MainActivity extends Activity {
         return lorieView;
     }
 
-    public void initLorieView(Context context) {
+    public LorieView attachLorieView(Context context, long generation) {
         if (getBaseContext() == null) {
-            attachBaseContext(context);
+            attachBaseContext(context.getApplicationContext());
         }
-        if (lorieView == null) {
-            lorieView = new LorieView(context);
-        }
+        if (lorieView != null)
+            releaseLorieView(lorieGeneration);
+        lorieView = new LorieView(context);
+        lorieGeneration = generation;
+        lorieView.resetRendererZoom();
+        return lorieView;
+    }
+
+    public boolean isLorieViewOwner(long generation) {
+        return lorieView != null && lorieGeneration == generation;
+    }
+
+    public void releaseLorieView(long generation) {
+        if (!isLorieViewOwner(generation))
+            return;
+        lorieView.releaseRenderer();
+        lorieView = null;
+        lorieGeneration = -1;
+        keyHandler = null;
+        mExtraKeys = null;
+        useTermuxEKBarBehaviour = false;
+    }
+
+    @Override
+    public Resources getResources() {
+        if (lorieView != null)
+            return lorieView.getContext().getResources();
+        Context base = getBaseContext();
+        return base != null ? base.getResources() : Resources.getSystem();
     }
 
     @Override
     public android.view.WindowManager getWindowManager() {
-        Context base = getBaseContext();
+        Context base = lorieView != null ? lorieView.getContext() : getBaseContext();
         if (base != null) {
             return (android.view.WindowManager) base.getSystemService(Context.WINDOW_SERVICE);
         }
@@ -53,6 +81,8 @@ public class MainActivity extends Activity {
 
     @Override
     public android.content.ComponentName getComponentName() {
+        if (lorieView != null && lorieView.getContext() instanceof Activity)
+            return ((Activity) lorieView.getContext()).getComponentName();
         return new android.content.ComponentName(this, MainActivity.class);
     }
 
@@ -68,13 +98,16 @@ public class MainActivity extends Activity {
     public void setExternalKeyboardConnected(boolean c) {}
     
     public static void getRealMetrics(DisplayMetrics metrics) {
-        if (instance.getBaseContext() != null) {
-            instance.getWindowManager().getDefaultDisplay().getRealMetrics(metrics);
+        if (instance.lorieView != null) {
+            metrics.setTo(instance.lorieView.getResources().getDisplayMetrics());
+            if (instance.lorieView.getMeasuredWidth() > 0 && instance.lorieView.getMeasuredHeight() > 0) {
+                metrics.widthPixels = instance.lorieView.getMeasuredWidth();
+                metrics.heightPixels = instance.lorieView.getMeasuredHeight();
+            }
+        } else if (instance.getBaseContext() != null) {
+            metrics.setTo(instance.getResources().getDisplayMetrics());
         } else {
-            metrics.widthPixels = 1920;
-            metrics.heightPixels = 1080;
-            metrics.density = 2.0f;
-            metrics.densityDpi = 320;
+            metrics.setTo(Resources.getSystem().getDisplayMetrics());
         }
     }
     
@@ -91,24 +124,20 @@ public class MainActivity extends Activity {
         return keyHandler != null && keyHandler.handle(event);
     }
 
-    public void setKeyHandler(KeyHandler handler) {
-        keyHandler = handler;
+    public void setKeyHandler(KeyHandler handler, long generation) {
+        if (isLorieViewOwner(generation))
+            keyHandler = handler;
     }
 
     // JNI STUBS
     public void clientConnectedStateChanged() {
         android.util.Log.e("MainActivity", "clientConnectedStateChanged called by native code!");
-        if (lorieView != null) {
+        final long generation = lorieGeneration;
+        for (long delay : new long[] {200, 500, 1000, 2000})
             handler.postDelayed(() -> {
-                android.util.Log.e("MainActivity", "Executing triggerCallback from MainActivity handler!");
-                lorieView.triggerCallback();
-            }, 200);
-            handler.postDelayed(() -> lorieView.triggerCallback(), 500);
-            handler.postDelayed(() -> lorieView.triggerCallback(), 1000);
-            handler.postDelayed(() -> lorieView.triggerCallback(), 2000);
-        } else {
-            android.util.Log.e("MainActivity", "lorieView is NULL in MainActivity!");
-        }
+                if (isLorieViewOwner(generation))
+                    lorieView.refreshRenderer();
+            }, delay);
     }
     public void showToast(String text) {}
     public void updateNotification() {}
