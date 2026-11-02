@@ -383,6 +383,13 @@ class DroidDeskPlatform {
         desktopDisplayMap(await _channel.invokeMethod<Object?>('getDesktopDisplays')),
       );
 
+  static Future<DesktopDisplayState> setAutoOpenOnMonitor(bool enabled) async =>
+      DesktopDisplayState.fromMap(
+        desktopDisplayMap(await _channel.invokeMethod<Object?>(
+          'setAutoOpenOnMonitor', {'enabled': enabled},
+        )),
+      );
+
   static Future<DesktopDisplaySettings> getDesktopDisplaySettings(String displayKey) async =>
       DesktopDisplaySettings.fromMap(
         desktopDisplayMap(await _channel.invokeMethod<Object?>(

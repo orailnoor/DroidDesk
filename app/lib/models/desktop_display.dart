@@ -60,6 +60,7 @@ class DesktopDisplayFailure {
 class DesktopDisplayState {
   DesktopDisplayState({
     this.phase = DesktopDisplayPhase.hidden,
+    this.autoOpenOnMonitor = true,
     this.activeDisplayId,
     this.activeDisplayKey,
     this.profileKind,
@@ -102,6 +103,7 @@ class DesktopDisplayState {
     }
     return DesktopDisplayState(
       phase: phase,
+      autoOpenOnMonitor: _required<bool>(map, 'autoOpenOnMonitor'),
       activeDisplayId: activeId,
       activeDisplayKey: activeKey,
       profileKind: profile == null
@@ -117,6 +119,7 @@ class DesktopDisplayState {
   }
 
   final DesktopDisplayPhase phase;
+  final bool autoOpenOnMonitor;
   final int? activeDisplayId;
   final String? activeDisplayKey;
   final DesktopProfileKind? profileKind;

@@ -62,6 +62,12 @@ class DesktopDisplayCoordinator(
     private var pendingStops = 0
     private var needsSessionStart = false
     private var sessionStarting = false
+    private var cancelAutomaticTimer: (() -> Unit)? = null
+    private var automaticTargetKey: String? = null
+    private var automaticSequence = 0L
+    private var automaticEpoch = 0L
+    private val automaticAttempts = mutableSetOf<String>()
+    private val automaticSuppressed = mutableSetOf<String>()
     val isStarting: Boolean get() = sessionStarting
     var sessionMode = "termux"
         private set
@@ -120,6 +126,7 @@ class DesktopDisplayCoordinator(
         }
         if (result.isSuccess) publish()
         sessionStartListeners.toList().forEach { if (isSessionCurrent(epoch)) it(result) }
+        if (result.isSuccess && isSessionCurrent(epoch)) refreshAutomaticOpening()
     }
 
     fun startStopping() {
@@ -185,6 +192,7 @@ class DesktopDisplayCoordinator(
     fun stop() {
         assertMainThread()
         if (isStopped) return
+        cancelAutomaticOpening()
         isStopped = true
         sessionGeneration++
         generation++
@@ -218,6 +226,7 @@ class DesktopDisplayCoordinator(
         repository = discovery
         host = AndroidDesktopDisplayHost(context.applicationContext, discovery)
         discovery.start { onDisplaysChanged() }
+        refreshAutomaticOpening()
     }
 
     fun subscribe(listener: (Map<String, Any?>) -> Unit): () -> Unit {
@@ -240,6 +249,7 @@ class DesktopDisplayCoordinator(
         val active = owner?.actualDisplay?.invoke()?.let { id -> displays.firstOrNull { it.id == id } }
         return mapOf(
             "schemaVersion" to 1,
+            "autoOpenOnMonitor" to automaticOpeningEnabled(),
             "phase" to phase,
             "activeDisplayId" to active?.id, "activeDisplayKey" to active?.key,
             "profileKind" to active?.let { kindFor(it).wireName },
@@ -261,6 +271,18 @@ class DesktopDisplayCoordinator(
     }
 
     fun loadSettings(kind: ProfileKind): DisplaySettings? = checkNotNull(settingsStore).load(kind)
+
+    fun setAutoOpenOnMonitor(enabled: Boolean) {
+        assertMainThread()
+        checkNotNull(settingsStore).saveAutoOpenOnMonitor(enabled)
+        cancelAutomaticOpening()
+        if (enabled) {
+            automaticAttempts.clear()
+            automaticSuppressed.clear()
+        }
+        publish()
+        refreshAutomaticOpening()
+    }
 
     fun setProfileRefresher(lease: RendererLease, refresh: ((Result<Unit>) -> Unit) -> Unit) {
         assertMainThread()
@@ -348,6 +370,8 @@ class DesktopDisplayCoordinator(
             completion(Result.failure(failure))
             return
         }
+        cancelAutomaticOpening()
+        if (target.isDefault) suppressAutomaticOpening()
         openTarget(target, completion, recovery = false)
     }
 
@@ -367,6 +391,7 @@ class DesktopDisplayCoordinator(
 
     fun moveToPhone(completion: (Result<Unit>) -> Unit) {
         assertMainThread()
+        suppressAutomaticOpening()
         val phone = displays().firstOrNull { it.isDefault }
         if (phone == null) {
             completion(Result.failure(DesktopDisplayException("DISPLAY_UNAVAILABLE", "The phone display is unavailable")))
@@ -407,6 +432,7 @@ class DesktopDisplayCoordinator(
             }
         }
         publish()
+        if (move !== pending || !isSessionCurrent(request.sessionGeneration)) return
         try {
             platform.launch(request)
         } catch (failure: DesktopDisplayException) {
@@ -442,6 +468,7 @@ class DesktopDisplayCoordinator(
             if (requestId == acceptedRequest) {
                 phase = "attached"
                 publish()
+                refreshAutomaticOpening()
             }
             return
         }
@@ -457,6 +484,7 @@ class DesktopDisplayCoordinator(
         if (pending.previous?.lease != lease) pending.previous?.finish?.invoke()
         publish()
         pending.completion(Result.success(Unit))
+        refreshAutomaticOpening()
     }
 
     fun onDisplayRemoved(displayId: Int) {
@@ -482,6 +510,67 @@ class DesktopDisplayCoordinator(
         }
         profileRefresher?.invoke {}
         publish()
+        refreshAutomaticOpening()
+    }
+
+    private fun automaticOpeningEnabled(): Boolean = settingsStore?.loadAutoOpenOnMonitor() ?: true
+
+    private fun cancelAutomaticOpening() {
+        automaticSequence++
+        cancelAutomaticTimer?.invoke()
+        cancelAutomaticTimer = null
+        automaticTargetKey = null
+    }
+
+    private fun suppressAutomaticOpening() {
+        cancelAutomaticOpening()
+        automaticSuppressed += displays().filterNot { it.isDefault }.map { it.key }
+    }
+
+    private fun automaticTarget(current: List<DesktopDisplay>): DesktopDisplay? {
+        val platform = host ?: return null
+        if (isStopped || sessionStarting || move != null || !automaticOpeningEnabled() || !platform.sessionRunning()) {
+            return null
+        }
+        val actual = owner?.actualDisplay?.invoke()
+        if (current.any { it.id == actual && !it.isDefault }) return null
+        return current.filter { !it.isDefault && it.eligible }.singleOrNull()?.takeIf {
+            it.key !in automaticAttempts && it.key !in automaticSuppressed
+        }
+    }
+
+    private fun refreshAutomaticOpening() {
+        val platform = host ?: return
+        val current = platform.displays()
+        val connections = current.filterNot { it.isDefault }.map { it.key }.toSet()
+        automaticAttempts.retainAll(connections)
+        automaticSuppressed.retainAll(connections)
+        if (automaticEpoch != sessionGeneration) {
+            automaticEpoch = sessionGeneration
+            automaticAttempts.clear()
+        }
+        val target = automaticTarget(current)
+        if (target == null) {
+            cancelAutomaticOpening()
+            return
+        }
+        if (automaticTargetKey == target.key) return
+        cancelAutomaticOpening()
+        automaticTargetKey = target.key
+        val sequence = automaticSequence
+        val epoch = sessionGeneration
+        cancelAutomaticTimer = platform.scheduleTimeout(500L) {
+            if (sequence != automaticSequence || !isSessionCurrent(epoch)) return@scheduleTimeout
+            cancelAutomaticTimer = null
+            automaticTargetKey = null
+            val latest = automaticTarget(platform.displays())
+            if (latest?.key != target.key) {
+                refreshAutomaticOpening()
+                return@scheduleTimeout
+            }
+            automaticAttempts += latest.key
+            openTarget(latest, {}, recovery = false)
+        }
     }
 
     fun onActivityMoved(lease: RendererLease, displayId: Int) {

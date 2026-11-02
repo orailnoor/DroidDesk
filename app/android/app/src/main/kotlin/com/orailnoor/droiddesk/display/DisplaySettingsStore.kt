@@ -22,6 +22,31 @@ class DisplaySettingsStore(
 
     constructor(context: Context) : this(AndroidDisplayPreferences(context))
 
+    fun loadAutoOpenOnMonitor(): Boolean {
+        ensureSchema()
+        val value = preferences.read("autoOpenOnMonitor")
+        if (value == null) return true
+        if (value is Boolean) return value
+        diagnostic("Invalid autoOpenOnMonitor; restoring Enabled")
+        preferences.write(mapOf("autoOpenOnMonitor" to true))
+        return true
+    }
+
+    fun saveAutoOpenOnMonitor(enabled: Boolean) {
+        ensureSchema()
+        val previous = preferences.read("autoOpenOnMonitor")
+        try {
+            preferences.write(mapOf("autoOpenOnMonitor" to enabled))
+        } catch (failure: IllegalStateException) {
+            try {
+                preferences.write(mapOf("autoOpenOnMonitor" to previous))
+            } catch (rollbackFailure: IllegalStateException) {
+                if (rollbackFailure !== failure) failure.addSuppressed(rollbackFailure)
+            }
+            throw failure
+        }
+    }
+
     fun load(kind: ProfileKind): DisplaySettings? {
         ensureSchema()
         if (kind == ProfileKind.PHONE && preferences.read("phone.inputMigrated") != true) {

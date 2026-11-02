@@ -301,6 +301,21 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getDesktopDisplays" -> result.success(displays.snapshot())
+                "setAutoOpenOnMonitor" -> {
+                    val enabled = (call.arguments as? Map<*, *>)?.get("enabled") as? Boolean
+                    if (enabled == null) {
+                        Log.w("DesktopDisplay", "Automatic monitor opening requires a Boolean enabled value")
+                        result.error("INVALID_ARGUMENT", "enabled must be a Boolean", null)
+                    } else {
+                        try {
+                            displays.setAutoOpenOnMonitor(enabled)
+                            result.success(displays.snapshot())
+                        } catch (error: IllegalStateException) {
+                            Log.e("DesktopDisplay", "Could not persist automatic monitor opening", error)
+                            result.error("DISPLAY_SETTINGS_SAVE_FAILED", error.message, null)
+                        }
+                    }
+                }
                 "saveDesktopDisplaySettings" -> {
                     val reply = DesktopLaunchReply(result, displays)
                     try {

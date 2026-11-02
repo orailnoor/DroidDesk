@@ -182,7 +182,19 @@ class _DisplaySettingsScreenState extends State<DisplaySettingsScreen> {
           ),
           const SizedBox(height: 8),
           const Text(
-            'Connecting a monitor only updates this list. Choose a display and use Open on monitor to move the view.',
+            'Automatic mode moves a running desktop to one available monitor. Manual display controls remain available.',
+          ),
+          SwitchListTile.adaptive(
+            key: const Key('desktop-auto-open-monitor'),
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Automatically open on a monitor'),
+            subtitle: const Text(
+              'Linux is not started automatically. Multiple monitors require selection.',
+            ),
+            value: snapshot.autoOpenOnMonitor,
+            onChanged: state.desktopDisplayBusy
+                ? null
+                : state.setAutoOpenOnMonitor,
           ),
           const SizedBox(height: 16),
           if (error != null)

@@ -78,6 +78,9 @@ class AppState extends ChangeNotifier {
   Future<DesktopDisplaySettings> getDesktopDisplaySettings(String key) =>
       DroidDeskPlatform.getDesktopDisplaySettings(key);
 
+  Future<void> setAutoOpenOnMonitor(bool enabled) =>
+      _runDesktopOperation(() => DroidDeskPlatform.setAutoOpenOnMonitor(enabled));
+
   Future<void> openDesktopOnDisplay(DesktopDisplayInfo display) =>
       _runDesktopOperation(() => DroidDeskPlatform.openDesktopOnDisplay(
         displayId: display.id, displayKey: display.key,
